@@ -18,6 +18,10 @@ Humming's optional integer re-encoding, which otherwise expands a complete
 expert projection to INT32 temporarily. Kernel repacking still needs working
 memory; avoiding that expansion does not establish full-model memory fit.
 
+NVIDIA target layers using fused QK normalization, RoPE, and KV insertion share
+identical FP32 RoPE tables. Draft and fallback attention paths keep private tables
+because their rotary operation can change the cache dtype.
+
 ## Checkpoint configuration
 
 For INT3 group-128 expert weights, the checkpoint's `quantization_config` uses
