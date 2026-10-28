@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     nvfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+    HummingIndexedExperts,
+)
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
@@ -51,6 +54,11 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.humming import (
+    HummingConfig,
+    HummingLayerQuantizationConfig,
+    HummingMoEMethod,
+)
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
@@ -443,7 +451,10 @@ class MusePostExpertFinalize:
 
 
 def _attach_post_expert_finalize(
-    quant_method: "MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE",
+    quant_method: (
+        "MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE"
+        " | MuseSparkHummingMoE"
+    ),
 ) -> None:
     """Hand the layer's finalizer to its experts, which exist only now."""
     assert quant_method.moe_kernel is not None
@@ -771,8 +782,47 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
         _attach_post_expert_finalize(self)
 
 
+class MuseSparkHummingMoE(HummingMoEMethod):
+    """Humming WNA16 experts with Muse's pre-norm TP reduction."""
+
+    muse_post_expert_finalize: MusePostExpertFinalize
+
+    def __init__(
+        self, quant_config: HummingLayerQuantizationConfig, moe: FusedMoEConfig
+    ) -> None:
+        _validate_route_major_deployment(moe)
+        pc = moe.moe_parallel_config
+        if pc.ep_size != 1 or pc.use_all2all_kernels:
+            raise NotImplementedError("MuseSpark Humming currently requires TP-only.")
+        from vllm.utils.humming import HummingWeightSchema
+
+        schema = quant_config.weight_schema
+        if not isinstance(schema, HummingWeightSchema):
+            raise NotImplementedError(
+                "Convert Muse expert tensors to Humming format before loading."
+            )
+        if schema.has_zero_point:
+            raise NotImplementedError(
+                "MuseSpark consolidated loader requires symmetric weights."
+            )
+        input_schema = quant_config.force_input_schema or quant_config.input_schema
+        input_schema = input_schema.to_humming_schema(moe.in_dtype)
+        if input_schema.a_dtype is not None and input_schema.a_dtype.num_bits < 16:
+            raise NotImplementedError(
+                "MuseSpark Humming currently requires BF16/FP16 inputs."
+            )
+        if quant_config.force_weight_schema is not None:
+            raise NotImplementedError("Convert Muse experts offline before loading.")
+        super().__init__(quant_config, moe)
+        self.experts_cls = HummingIndexedExperts
+
+    def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
+        super().process_weights_after_loading(layer)
+        _attach_post_expert_finalize(self)
+
+
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
-    """Consolidated-tensor experts with the NVFP4 / BF16 quant methods."""
+    """Consolidated-tensor experts with NVFP4, BF16, or Humming methods."""
 
     def _get_quant_method(
         self,
@@ -780,6 +830,10 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
         quant_config: QuantizationConfig | None,
         moe_config: FusedMoEConfig,
     ) -> FusedMoEMethodBase:
+        if isinstance(quant_config, HummingConfig):
+            config = quant_config.get_quant_config_for_layer(prefix, "moe")
+            if config is not None:
+                return MuseSparkHummingMoE(config, moe_config)
         if isinstance(quant_config, ModelOptNvFp4Config) and not (
             quant_config.is_layer_excluded(prefix)
         ):
