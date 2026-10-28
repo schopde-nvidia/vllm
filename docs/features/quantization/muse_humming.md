@@ -36,7 +36,15 @@ Real Muse expert-layer weights have been exercised at TP1 and TP4 on GB10.
 This verifies execution against the decoded INT3 reference. It does not measure
 the quality loss caused by converting NVFP4 weights to INT3.
 
-Full-model startup, generation quality, and serving performance remain under
-investigation. Checkpoint byte size alone does not establish memory fit: runtime
+A converted 816B checkpoint has completed startup and short chat generations on
+four GB10 nodes with TP4, BF16 activations, a 2,048-token context, one active
+sequence, and 1 GiB of KV cache per GPU. vLLM reported 89.0 GiB of model memory per
+rank; sharing target RoPE tables saved 11.25 GiB per rank before expert preparation.
+Nsight captures were collected on all four ranks for a generation request.
+
+The smoke checks answered basic arithmetic and geography prompts and completed
+a short technical explanation. They do not establish general model accuracy,
+quality preservation versus NVFP4, or serving performance. No broad model
+evaluation or controlled performance comparison has been completed. Runtime
 parameters, replicated projections, repacking buffers, KV cache, and the operating
 system also consume memory, especially on devices with shared CPU/GPU memory.
