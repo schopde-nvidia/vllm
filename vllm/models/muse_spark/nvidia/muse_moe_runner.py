@@ -786,6 +786,8 @@ class MuseSparkHummingMoE(HummingMoEMethod):
     """Humming WNA16 experts with Muse's pre-norm TP reduction."""
 
     muse_post_expert_finalize: MusePostExpertFinalize
+    # Re-encoding all experts at once expands packed INT3 to INT32 during load.
+    convert_symmetric_integer = False
 
     def __init__(
         self, quant_config: HummingLayerQuantizationConfig, moe: FusedMoEConfig

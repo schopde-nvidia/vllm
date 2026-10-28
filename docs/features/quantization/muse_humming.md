@@ -13,6 +13,11 @@ The indexed Humming experts pass their second GEMM outputs to Muse's existing
 finalizer. Tensor-parallel partial outputs are summed before each expert's
 RMSNorm; FP32 routing weights are then applied before summing selected experts.
 
+Muse keeps the checkpoint's integer representation during loading. It skips
+Humming's optional integer re-encoding, which otherwise expands a complete
+expert projection to INT32 temporarily. Kernel repacking still needs working
+memory; avoiding that expansion does not establish full-model memory fit.
+
 ## Checkpoint configuration
 
 For INT3 group-128 expert weights, the checkpoint's `quantization_config` uses
