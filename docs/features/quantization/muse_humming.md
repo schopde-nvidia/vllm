@@ -80,3 +80,32 @@ matched the previously served conversion by SHA256. These are 100-example
 pilots, not full benchmark runs. No original-NVFP4 baseline or controlled
 performance comparison was evaluated, so quantization accuracy loss and serving
 speedup remain unmeasured.
+
+### Interrupted GPQA Diamond evaluation
+
+A separate run on 2026-10-29 attempted all 198 GPQA Diamond questions with
+the same converted checkpoint. The eight-hour allocation expired after 75
+responses completed; 68 of those 75 were correct (90.7%). Another four requests
+were interrupted without response records, and 119 questions were not started.
+The 123 unfinished cases are missing, rather than completed incorrect answers.
+This is not a complete 198-question benchmark score.
+
+The 75 completed requests had zero request errors. Four reached the output
+limit with empty, unparsed final answers; all four remain in the denominator
+as incorrect. The nominal 95% Wilson interval among completed cases is
+82.0–95.4%. This incomplete single pass can favor requests that finish sooner;
+that selection effect is not covered by the interval. There is no matched
+original-NVFP4 run, so this result does not measure quantization accuracy loss.
+Published NVFP4 scores are external references with different evaluation setups.
+
+This run used TP4 on four GB10 nodes, BF16 activations, eager execution, a
+32,768-token context, 4 GiB of KV cache per rank, concurrency four, `xhigh`
+reasoning effort, temperature 1, `top_p=1`, disabled `top_k`, generation seed 7,
+and 16,384 output tokens including reasoning. Settings stayed unchanged.
+The prompt, choice permutation, and final-answer extraction followed
+OpenAI simple-evals at `652c89d0ca9df547706735883097e9537d40dc47`, with
+choice-permutation seed 0. The author dataset revision was
+`56686c06f5e19865c153de0fdb11be3890014df7`. Only final answer content was scored.
+All raw responses, missing-case IDs, settings, and termination logs were retained
+in the private evaluation archive for resumption; benchmark examples are omitted
+from this documentation.
