@@ -43,8 +43,40 @@ rank; sharing target RoPE tables saved 11.25 GiB per rank before expert preparat
 Nsight captures were collected on all four ranks for a generation request.
 
 The smoke checks answered basic arithmetic and geography prompts and completed
-a short technical explanation. They do not establish general model accuracy,
-quality preservation versus NVFP4, or serving performance. No broad model
-evaluation or controlled performance comparison has been completed. Runtime
-parameters, replicated projections, repacking buffers, KV cache, and the operating
-system also consume memory, especially on devices with shared CPU/GPU memory.
+a short technical explanation. Runtime parameters, replicated projections,
+repacking buffers, KV cache, and the operating system also consume memory,
+especially on devices with shared CPU/GPU memory.
+
+### Pilot evaluation
+
+On 2026-10-29, the converted checkpoint completed 100 GSM8K test examples and
+100 IFEval examples on four GB10 nodes. Each sample was drawn uniformly without
+replacement with selection seed 42. The run used zero-shot prompts, temperature
+0, generation seed 7, low reasoning effort, a 2,048-token context, and a
+1,536-token generation budget including reasoning. Server and client concurrency
+were both four; the other serving settings matched the smoke run above.
+
+| Metric | Result |
+| --- | --- |
+| GSM8K exact match, strict and flexible extraction | 95/100 (95%) |
+| IFEval prompt accuracy, strict and loose | 88/100 (88%) |
+| IFEval instruction accuracy, strict and loose | 132/148 (89.2%) |
+| Request errors | 0/200 |
+| Token-limit truncations | 2/100 GSM8K; 11/100 IFEval |
+| Empty final answers | 1/100 GSM8K; 4/100 IFEval |
+
+Only final answer content was graded; the separate reasoning field was excluded.
+GSM8K prompts requested a final `#### <number>` line, scored by decimal-normalized
+numeric exact match. Flexible extraction used the last number in the final answer.
+IFEval used the unmodified Google Research strict and loose scorers. All selected
+cases, including truncations and empty final answers, remained in the denominator.
+The 95% Wilson intervals are 88.8–97.8% for GSM8K and 80.2–93.0% for IFEval
+prompt accuracy.
+
+The data/scorer revisions were `3101c7d5072418e28b9008a6636bde82a006892c`
+for OpenAI's GSM8K repository and `1ae1fded5c616deb6b4652818588577e8fca0f06`
+for Google Research's IFEval implementation. All 189 rebuilt weight shards
+matched the previously served conversion by SHA256. These are 100-example
+pilots, not full benchmark runs. No original-NVFP4 baseline or controlled
+performance comparison was evaluated, so quantization accuracy loss and serving
+speedup remain unmeasured.
