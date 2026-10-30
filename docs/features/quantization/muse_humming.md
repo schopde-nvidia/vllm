@@ -1,4 +1,4 @@
-# Muse Spark with Humming experts (experimental)
+# Muse Spark with Humming and IQ2 experts (experimental)
 
 Muse Spark can load offline-converted Humming expert tensors with BF16 or FP16
 activations. Select the path with `--quantization humming --moe-backend humming`.
@@ -81,10 +81,122 @@ pilots, not full benchmark runs. No original-NVFP4 baseline or controlled
 performance comparison was evaluated, so quantization accuracy loss and serving
 speedup remain unmeasured.
 
-### Interrupted GPQA Diamond evaluation
+### IQ2_XS with ModelOpt and b12x
+
+On DGX Spark (GB10, SM121), an offline-converted IQ2_XS checkpoint can select
+the experimental SM12x path
+with `--quantization modelopt_mixed --moe-backend auto --dtype bfloat16`.
+This uses b12x kernels inside vLLM and requires an already converted checkpoint.
+The Humming quantization flag does not select IQ2.
+
+Install the optional [b12x dependencies](b12x.md) in the serving environment.
+For Muse, keep `--moe-backend auto` so both IQ2 experts and retained BF16 experts
+can select their respective backends. The generic b12x example's explicit
+`--moe-backend b12x` is not the validated mixed Muse configuration.
+
+For the validated four-node setup, put an identical checkpoint at `MODEL_PATH`
+on every node and set `MASTER_ADDR` to the head node's reachable address.
+This recipe and the reported checks cover text generation only;
+`--language-model-only` disables multimodal inputs.
+Run this on each node with `NODE_RANK` set to 0, 1, 2, or 3 respectively:
+
+```bash
+extra_args=(--host 0.0.0.0 --port 8000)
+if [ "$NODE_RANK" != 0 ]; then extra_args=(--headless); fi
+vllm serve "$MODEL_PATH" \
+    --quantization modelopt_mixed --moe-backend auto --dtype bfloat16 \
+    --distributed-executor-backend mp --nnodes 4 --node-rank "$NODE_RANK" \
+    --master-addr "$MASTER_ADDR" --master-port 29541 --tensor-parallel-size 4 \
+    --reasoning-parser muse --enforce-eager --disable-custom-all-reduce \
+    --max-model-len 32768 --max-num-seqs 4 --max-num-batched-tokens 128 \
+    --kv-cache-memory-bytes 4294967296 --language-model-only \
+    --load-format safetensors --safetensors-load-strategy lazy \
+    "${extra_args[@]}"
+```
+
+Configure the network interfaces for the actual cluster, following
+[distributed serving guidance](../../serving/parallelism_scaling.md).
+
+Use `quant_method: modelopt`, `quant_algo: MIXED_PRECISION`, and a
+`quantized_layers` entry for each converted `model.language_model.layers.N.mlp.experts`
+prefix. Each entry must specify `quant_algo: IQ2_XS`, `group_size: 256`,
+`block_payload_bytes: 74`, and `packing: ggml`. Store consolidated gate/up and
+down expert tensors as native IQ2_XS blocks. Unlisted experts use BF16.
+IQ2_XS stores 256 weights in 74 bytes, including block metadata (2.3125 bits per
+weight). This density does not include the checkpoint's retained BF16 tensors.
+
+The adapter requires BF16 activations and tensor parallelism, with DP1, PCP1,
+and expert parallelism disabled. On SM12x, retained BF16 experts use Triton.
+The IQ2 adapter expands selected routes into separate b12x rows, sums TP partial
+outputs before each expert's RMSNorm, and applies routing weights afterward.
+Eager execution is the validated mode; this work does not establish CUDA graph
+compatibility or a speedup over Humming.
+
+Serving validation used b12x 1.5.1. Offline encoding used ModelOpt development
+revision [`cb9ab4de0698bfdf701cad4924093867b790eb17`](https://github.com/NVIDIA/Model-Optimizer/tree/cb9ab4de0698bfdf701cad4924093867b790eb17);
+ModelOpt 0.47 lacks that IQ2 encoder. Serving already packed expert tensors uses
+vLLM's ModelOpt checkpoint loader and b12x kernels, without running the encoder.
+Four complete real Muse experts passed TP4 checks on GB10 against a decoded IQ2
+reference, with relative L2 errors of 0.00403, 0.00353, and 0.00306 at batch sizes
+1, 4, and 17. Retained BF16 experts also passed TP4 checks. These tests establish
+kernel correctness against the quantized weights, not model accuracy.
+
+The experimental conversion uses unweighted IQ2_XS codebook search without
+calibration data. It starts from the authorized original NVFP4 revision and
+retains BF16 expert layers 0 and 61. The earlier INT3 checkpoint also quantized
+those boundary experts, so any subsequent accuracy comparison must account for
+the different retained precision as well as the codec.
+
+The full conversion produced 189 weight shards with 299.53 GiB of tensor data.
+All four node copies passed SHA256 verification, and vLLM reached serving
+readiness with TP4 and a 32,768-token context. Model loading reported 80.38 GiB
+per rank, excluding the subsequent 4 GiB KV cache and runtime workspaces.
+Three arithmetic smoke requests returned the correct final answer under greedy
+low, sampled low, and sampled xhigh reasoning. An earlier greedy request reached
+its 256-token cap without a final answer; the three follow-ups used a 1,024-token
+cap and ran concurrently. These small checks establish generation, not IQ2
+accuracy or a controlled comparison with the earlier INT3 checkpoint.
+
+#### IQ2 streaming and partial GPQA results
+
+Eight streaming requests measured the TP4 deployment after warmup, with four
+requests at each concurrency. Temperature was 1, seed 7, reasoning effort
+`low`, and the output cap 512 tokens. These API measurements include reasoning
+and control tokens; TTFT measures the first generated token.
+
+| Measurement | Concurrency 1 | Concurrency 4 |
+| --- | --- | --- |
+| Aggregate output tokens/s | 11.59 | 30.37 |
+| Median per-request decode tokens/s | 11.92 | 8.05 |
+| Median TTFT | 0.946 s | 2.568 s |
+| Mean observed inter-token latency | 83.94 ms | 124.75 ms |
+
+There were zero request errors, six output-limit truncations, and four empty
+final answers. This small performance sample does not establish a speedup
+over INT3 or represent a production workload distribution.
+
+A separate IQ2 GPQA Diamond run used the same 198-question manifest, scorer,
+and generation settings as the INT3 run below, prioritizing its completed
+question IDs. The last retrievable snapshot at 15:56 UTC on 2026-10-30 contains
+66 responses, with 57 correct (86.4% of retrieved cases). It contains zero
+request errors and five capped responses with empty, unparsed final answers;
+those five count as incorrect. The nominal 95% Wilson interval is 76.1–92.7%.
+The same 66 IDs yielded 59 correct with INT3. Both deployments used one pass;
+IQ2 also retained BF16 boundary experts that the INT3 conversion quantized.
+
+Cluster access failed before further results could be retrieved. The scheduled
+allocation end passed at 19:23:31 UTC, but its terminal state and any additional
+responses remain unverified. The 132 cases absent from the saved snapshot are
+missing, not scored incorrect. Completion order can bias this partial subset,
+and the interval does not cover that selection effect. This is not a complete
+GPQA score or a matched measurement of loss against original NVFP4. Published
+NVFP4 scores remain external references. Raw records, settings, and integrity
+hashes are preserved in the private experiment archive.
+
+### Interrupted INT3 GPQA Diamond evaluation
 
 A separate run on 2026-10-29 attempted all 198 GPQA Diamond questions with
-the same converted checkpoint. The eight-hour allocation expired after 75
+the Humming INT3 checkpoint. The eight-hour allocation expired after 75
 responses completed; 68 of those 75 were correct (90.7%). Another four requests
 were interrupted without response records, and 119 questions were not started.
 The 123 unfinished cases are missing, rather than completed incorrect answers.
@@ -107,5 +219,6 @@ OpenAI simple-evals at `652c89d0ca9df547706735883097e9537d40dc47`, with
 choice-permutation seed 0. The author dataset revision was
 `56686c06f5e19865c153de0fdb11be3890014df7`. Only final answer content was scored.
 All raw responses, missing-case IDs, settings, and termination logs were retained
-in the private evaluation archive for resumption; benchmark examples are omitted
+in the private evaluation archive; the user stopped further INT3 evaluation.
+Benchmark examples are omitted
 from this documentation.

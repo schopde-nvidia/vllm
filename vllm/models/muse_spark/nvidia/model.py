@@ -68,7 +68,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.humming import HummingConfig
-from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
@@ -1779,8 +1782,11 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
     supported_quantization_configs: tuple[type[QuantizationConfig], ...] = (
         ModelOptNvFp4Config,
         HummingConfig,
+        ModelOptMixedPrecisionConfig,
     )
-    supported_quantization_description = "NVFP4 (modelopt_fp4) or converted Humming"
+    supported_quantization_description = (
+        "NVFP4 (modelopt_fp4), converted Humming, or ModelOpt IQ2 block codecs"
+    )
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

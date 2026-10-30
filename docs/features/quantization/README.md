@@ -10,7 +10,7 @@ The following are the supported quantization formats for vLLM:
 - [AutoAWQ](auto_awq.md)
 - [BitsAndBytes](bnb.md)
 - [GPTQModel](gptqmodel.md)
-- [Muse Spark with Humming experts (experimental)](muse_humming.md)
+- [Muse Spark with Humming and IQ2 experts (experimental)](muse_humming.md)
 - [Intel Neural Compressor](inc.md)
 - [LLM Compressor](llm_compressor/README.md)
     - [FP8 W8A8](llm_compressor/fp8.md)
