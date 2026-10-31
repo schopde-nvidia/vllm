@@ -292,6 +292,43 @@ settings. These observed speedups do not establish a production workload result
 or any model accuracy score. All raw responses, token arrivals, counters and
 exact launch commands are retained in the private experiment archive.
 
+#### Interrupted DFlash2 GPQA Diamond evaluation
+
+A separate accuracy run on 2026-10-31 attempted all 198 GPQA Diamond questions
+with the same IQ2_XS target and the BF16 DFlash2 draft. The allocation reached
+its time limit after 185 responses completed, with 157 correct (84.9% of
+completed cases). Four requests were interrupted without response records,
+and nine questions were never started. These 13 missing cases are excluded
+from the completed-case score; this is not the full 198-question result.
+
+The saved responses contain zero request errors. Thirteen completed responses
+were both truncated at the output limit and empty/unparsed in their final
+answers; all count as incorrect. The nominal 95% Wilson interval among completed
+cases is 79.0–89.3%. This was one stochastic pass, and completion before a time
+limit can bias the subset; that selection effect is not included in the interval.
+
+Generation settings matched the historical IQ2 evaluation: `xhigh` reasoning,
+temperature 1, `top_p=1`, disabled `top_k`, seed 7, 16,384 output tokens including
+reasoning, 32,768 context tokens, and concurrency four. The manifest, prompt,
+choice permutation, and final-only scorer were unchanged apart from the served
+model name. Fresh tokenization matched all historical prompt counts. The 118
+previously completed IQ2 question IDs were prioritized independently of
+correctness, followed by the other 80.
+
+On those same 118 IDs, IQ2 with DFlash2 scored 99/118 (83.9%) and historical
+IQ2 without the draft scored 95/118 (80.5%). Both answered the same 93 questions
+correctly; six were
+correct only with DFlash2 and two only in the historical IQ2 run. The latter
+used a different runtime setup; these one-pass results do not establish that
+DFlash2 improves accuracy. There is no matched original-NVFP4 baseline, so
+published NVFP4 results remain external references, not quantization-loss
+measurements.
+
+All 185 raw responses, missing IDs, scoring results, settings, and termination
+evidence are preserved privately. The previously saved 161 records remain
+byte-identical, and the final local and remote response hashes match. Benchmark
+questions and raw examples are excluded from this documentation.
+
 ### Interrupted INT3 GPQA Diamond evaluation
 
 A separate run on 2026-10-29 attempted all 198 GPQA Diamond questions with
