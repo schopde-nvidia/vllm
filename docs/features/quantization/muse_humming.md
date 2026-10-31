@@ -196,6 +196,102 @@ of loss against original NVFP4. Published NVFP4 scores remain external reference
 Raw records, terminal logs, settings, and integrity hashes are preserved in the
 private experiment archive.
 
+### DFlash2 speculative decoding with the IQ2 target
+
+The experimental IQ2_XS target also served with the native vLLM DFlash2 draft
+on four DGX Sparks (GB10). DFlash2 is disabled in the IQ2 command above by
+default. To enable it, keep the IQ2 TP4 command and set
+`VLLM_USE_V2_MODEL_RUNNER=1`. Add `--gpu-memory-utilization 0.85` and append
+`--speculative-config` with this JSON,
+replacing `/path/to/draft` with the same local draft path on every node:
+
+```json
+{
+  "method": "dflash",
+  "model": "/path/to/draft",
+  "num_speculative_tokens": 7,
+  "draft_sample_method": "probabilistic",
+  "draft_tensor_parallel_size": 4
+}
+```
+
+The tested draft was
+[`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2)
+at revision `22e2669e4c60689f9bff0749a34d9d8e59ce7cd6`. It is a five-layer
+BF16 draft used alongside the existing Muse target; do not replace the target
+checkpoint with it. Its 8.17 GiB weight file adds about 2.7% to the IQ2 target's
+299.53 GiB of tensor data. This storage calculation excludes runtime workspaces.
+
+Validation on 2026-10-31 used vLLM commit
+`5ea8301982648ac444ea01368ecb1b064f6de7bc`, the Muse overlay from this tracking
+branch at `b1190e0f5780ef557cb2d3ee9f75d92a29c3dd95`, b12x 1.5.1, BF16
+activations, eager execution, TP4, a 32,768-token context, four sequences,
+128 batched tokens, 4 GiB KV cache per rank, and GPU memory utilization 0.85.
+The runtime used the wheel from that upstream commit with these five Python
+files replaced by their versions at the pinned tracking-branch commit:
+
+- `vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py`
+- `vllm/model_executor/layers/quantization/humming.py`
+- `vllm/model_executor/layers/quantization/utils/humming/moe.py`
+- `vllm/models/muse_spark/nvidia/model.py`
+- `vllm/models/muse_spark/nvidia/muse_moe_runner.py`
+
+The upstream wheel alone does not include this experimental Muse IQ2 path.
+All original IQ2 checkpoint hashes and the pinned draft hash matched on all
+four nodes. Four-rank NCCL RoCE all-reduce and broadcast checks passed.
+
+Logs confirmed native `DFlash2Speculator` / `DFlash2Qwen3ForCausalLM`, with
+unquantized BF16 draft weights. Pointer checks verified that both the draft
+embedding and output head share the target's actual weight storage on every
+rank. vLLM reported 83.46 GiB of model-loading memory per rank, excluding later
+KV allocations and runtime workspaces. An arithmetic smoke completed with the
+correct final answer, and draft-token acceptance counters advanced.
+
+Eight measured requests then completed, four at concurrency 1 and four at
+concurrency 4, with zero errors, truncations, or empty final answers. The
+streaming client used four fixed short prompts, temperature 1, seed 7, low
+reasoning effort, and a 4,096-token output cap. Shape warmups preceded each
+measurement series, and unique cache salts prevented prompt-prefix reuse.
+Raw streaming events, responses, token counts, commands and counters were saved.
+The same IQ2 target was then measured without DFlash2 on the same nodes and
+runtime, using the identical prompts, request settings and warmup procedure.
+All eight baseline responses also completed without errors, truncations or empty
+final answers. The servers ran sequentially; each arm was warmed before timing.
+
+| Measurement | Baseline C1 | DFlash2 C1 | Baseline C4 | DFlash2 C4 |
+| --- | --- | --- | --- | --- |
+| Aggregate output tokens/s | 11.66 | 23.88 | 28.94 | 49.86 |
+| Median per-request decode tokens/s | 11.93 | 25.78 | 8.25 | 15.25 |
+| Median first-generated-token TTFT | 0.974 s | 0.973 s | 2.630 s | 2.912 s |
+| Median effective time/output token | 83.84 ms | 38.81 ms | 121.20 ms | 65.60 ms |
+| Median inter-chunk gap | 83.59 ms | 170.40 ms | 121.29 ms | 307.51 ms |
+| Median first final-answer content | 43.19 s | 19.55 s | 68.97 s | 34.92 s |
+| Mean tokens per streamed chunk | 1.00 | 4.36 | 1.00 | 4.75 |
+
+Here C1/C4 mean one/four concurrent requests. Aggregate output throughput was
+2.05x/1.72x the corresponding baseline. Baseline model-loading memory was
+80.38 GiB per rank versus 83.46 GiB with DFlash2; neither is a total runtime peak.
+
+DFlash2 accepted 1,608 of 3,318 proposed tokens at C1 (48.46%) and 1,733 of
+3,206 at C4 (54.05%). Across 474/458 draft steps, mean acceptance length was
+4.39/4.78 tokens including one target/bonus token, or 3.39/3.78 accepted draft
+tokens. Each step proposed seven draft tokens.
+
+All output throughput includes reasoning and control tokens. First generated
+TTFT differs from first final-answer content, which follows reasoning. DFlash2
+returns bursts: effective time/output token averages the observed decode span
+and does not measure individual token latency inside a burst. The sparse subset
+of adjacent one-token chunks had mean gaps 171.41/301.06 ms (21/15 samples),
+so it must not be compared as a full ITL distribution with the baseline's
+83.85/121.64 ms (2,468/2,523 samples). No DFlash2 Nsight breakdown of draft
+computation, target verification, or communication was collected.
+
+This is four fixed prompts per concurrency per arm, one pass. Sampled outputs,
+lengths and reasoning counts differed between arms despite identical request
+settings. These observed speedups do not establish a production workload result
+or any model accuracy score. All raw responses, token arrivals, counters and
+exact launch commands are retained in the private experiment archive.
+
 ### Interrupted INT3 GPQA Diamond evaluation
 
 A separate run on 2026-10-29 attempted all 198 GPQA Diamond questions with
