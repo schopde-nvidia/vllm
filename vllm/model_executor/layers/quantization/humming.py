@@ -638,6 +638,8 @@ class HummingLinearMethod(LinearMethodBase):
 
 
 class HummingMoEMethod(FusedMoEMethodBase):
+    convert_symmetric_integer = True
+
     def __init__(
         self, quant_config: HummingLayerQuantizationConfig, moe: "FusedMoEConfig"
     ) -> None:
@@ -815,6 +817,7 @@ class HummingMoEMethod(FusedMoEMethodBase):
             input_schema=self.input_schema,
             force_weight_schema=self.force_weight_schema,
             allow_input_schema_fallback=self.quant_config.allow_input_schema_fallback,
+            convert_symmetric_integer=self.convert_symmetric_integer,
         )
 
         # Build the MoE kernel
