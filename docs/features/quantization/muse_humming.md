@@ -177,21 +177,24 @@ over INT3 or represent a production workload distribution.
 
 A separate IQ2 GPQA Diamond run used the same 198-question manifest, scorer,
 and generation settings as the INT3 run below, prioritizing its completed
-question IDs. The last retrievable snapshot at 15:56 UTC on 2026-10-30 contains
-66 responses, with 57 correct (86.4% of retrieved cases). It contains zero
-request errors and five capped responses with empty, unparsed final answers;
-those five count as incorrect. The nominal 95% Wilson interval is 76.1–92.7%.
-The same 66 IDs yielded 59 correct with INT3. Both deployments used one pass;
-IQ2 also retained BF16 boundary experts that the INT3 conversion quantized.
+question IDs. After cluster access recovered on 2026-10-31, all 118 completed
+responses were retrieved, with 95 correct (80.5%). There were zero request
+errors and 12 capped responses with empty, unparsed final answers; those 12
+count as incorrect. The nominal 95% Wilson interval is 72.4–86.6%.
+Across the same 75 question IDs completed by both deployments, IQ2 scored
+65/75 (86.7%) and INT3 scored 68/75 (90.7%). Both used one pass; IQ2 also
+retained BF16 boundary experts that the INT3 conversion quantized.
 
-Cluster access failed before further results could be retrieved. The scheduled
-allocation end passed at 19:23:31 UTC, but its terminal state and any additional
-responses remain unverified. The 132 cases absent from the saved snapshot are
-missing, not scored incorrect. Completion order can bias this partial subset,
-and the interval does not cover that selection effect. This is not a complete
-GPQA score or a matched measurement of loss against original NVFP4. Published
-NVFP4 scores remain external references. Raw records, settings, and integrity
-hashes are preserved in the private experiment archive.
+Slurm accounting confirms that the allocation timed out at 19:23:49 UTC on
+2026-10-30. Four requests were interrupted without response records and 76
+questions were never started. The 80 unfinished cases are missing, not scored
+incorrect. All 66 responses saved before the connectivity outage remain
+byte-identical within the recovered file, whose hash matches the remote copy.
+Completion order can bias this partial subset, and the interval does not cover
+that selection effect. This is not a complete GPQA score or a matched measurement
+of loss against original NVFP4. Published NVFP4 scores remain external references.
+Raw records, terminal logs, settings, and integrity hashes are preserved in the
+private experiment archive.
 
 ### Interrupted INT3 GPQA Diamond evaluation
 
