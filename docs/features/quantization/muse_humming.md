@@ -292,6 +292,51 @@ settings. These observed speedups do not establish a production workload result
 or any model accuracy score. All raw responses, token arrivals, counters and
 exact launch commands are retained in the private experiment archive.
 
+#### DFlash2 with 8K uncached inputs
+
+A follow-up on 2026-11-01 measured the same four tasks at C1 and C4 after
+adding synthetic background to make each input exactly 8,192 tokens,
+including the chat template. Both tokenization and response usage confirmed
+the input length. Unique cache salts prevented prefix reuse, and server
+counters recorded all 32,768 input tokens computed in each four-request run.
+
+The IQ2 target, BF16 draft, full runtime package list, and generation settings
+were unchanged: low reasoning, temperature 1, seed 7, and a 4,096-token output
+cap. Server settings retained TP4, eager execution, 32,768 context tokens,
+four sequences, `max_num_batched_tokens=128`, 4 GiB KV cache per rank, and
+seven probabilistic draft tokens. All eight measured responses finished with
+zero request errors, truncations, or empty final answers.
+
+| Measurement | 8K input C1 | 8K input C4 |
+| --- | --- | --- |
+| Median first-generated TTFT | 37.18 s | 101.38 s |
+| Median first final-content latency | 43.85 s | 119.98 s |
+| Median per-request decode throughput | 18.84 tokens/s | 6.10 tokens/s |
+| Aggregate output throughput, including prefill | 5.06 tokens/s | 7.83 tokens/s |
+| Median effective time per output token | 53.82 ms | 168.13 ms |
+| Median inter-chunk gap | 172.27 ms | 581.27 ms |
+| Mean acceptance length, including bonus | 3.41 tokens | 3.81 tokens |
+
+Draft acceptance was 732/2,128 proposed tokens (34.40%) across 304 draft
+steps at C1, and 1,129/2,814 (40.12%) across 402 steps at C4. Generated output
+totaled 1,040/1,535 tokens, including 486/975 reasoning tokens. Throughput
+includes reasoning and control tokens; speculative bursts still prevent
+observing individual token timestamps within each burst.
+
+Server timing counters showed mean prefill spans of 37.02/41.86 seconds
+and mean queue waits below 0.001/58.69 seconds at C1/C4. These are wall-clock
+request spans, including scheduling interference, rather than isolated GPU
+kernel timings. The 128-token batching limit remained unchanged.
+
+The earlier short inputs were 157–165 tokens, with TTFT 0.97/2.91 seconds,
+median decode throughput 25.78/15.25 tokens/s, and aggregate output throughput
+23.88/49.86 tokens/s. This follow-up used different physical nodes and GPU
+drivers; sampled output lengths also differed. Four synthetic prompts per
+concurrency in one pass do not isolate a causal input-length effect or establish
+production performance. Raw responses, streams, counters, settings, hashes,
+and the complete runtime and checkpoint verification evidence are retained
+in the private experiment archive.
+
 #### Interrupted DFlash2 GPQA Diamond evaluation
 
 A separate accuracy run on 2026-10-31 attempted all 198 GPQA Diamond questions
