@@ -1,104 +1,86 @@
 # Muse Spark with Humming and IQ2 experts (experimental)
 
-Muse Spark can load offline-converted Humming expert tensors with BF16 or FP16
-activations. Select the path with `--quantization humming --moe-backend humming`.
-The checkpoint must already contain Humming packed weights and scales; these
-flags do not convert the original NVFP4 checkpoint to INT3.
+Muse Spark supports offline-converted Humming INT3 and ModelOpt IQ2_XS expert
+weights. Both paths preserve Muse's expert computation order: second projection,
+TP all-reduce, per-expert RMSNorm, then routing weights and the expert sum.
+The serving flags below require an already converted checkpoint.
 
-This experimental integration supports tensor parallelism with DP1, PCP1, and
-expert parallelism disabled. It requires symmetric Humming weights, without
-zero points or online requantization. Other Muse layers can remain unquantized.
+## Humming INT3
 
-The indexed Humming experts pass their second GEMM outputs to Muse's existing
-finalizer. Tensor-parallel partial outputs are summed before each expert's
-RMSNorm; FP32 routing weights are then applied before summing selected experts.
+Use `--quantization humming --moe-backend humming` with BF16 or FP16 activations.
+The adapter requires symmetric Humming weights, DP1, PCP1, and no expert
+parallelism. Online requantization and weights with zero points are unsupported.
+Other Muse projections can remain unquantized.
 
-Muse keeps the checkpoint's integer representation during loading. It skips
-Humming's optional integer re-encoding, which otherwise expands a complete
-expert projection to INT32 temporarily. Kernel repacking still needs working
-memory; avoiding that expansion does not establish full-model memory fit.
+For INT3 group-128 weights, set these fields in `quantization_config`:
 
-NVIDIA target layers using fused QK normalization, RoPE, and KV insertion share
-identical FP32 RoPE tables. Draft and fallback attention paths keep private tables
+```json
+{
+  "quant_method": "humming",
+  "weight_dtype": "int3",
+  "input_dtype": "bfloat16",
+  "weight_scale_group_size": 128
+}
+```
+
+Preserve checkpoint exclusions for unquantized projections, including fused
+attention projections. Store experts as consolidated gate/up and down tensors
+with their group scales.
+
+Muse skips Humming's optional integer re-encoding to avoid expanding an entire
+packed expert projection to INT32 during loading. Kernel repacking still needs
+working memory. NVIDIA target layers using fused QK normalization, RoPE, and KV
+insertion share FP32 RoPE tables. Draft and fallback paths keep private tables
 because their rotary operation can change the cache dtype.
 
-## Checkpoint configuration
+## IQ2_XS with ModelOpt and b12x
 
-For INT3 group-128 expert weights, the checkpoint's `quantization_config` uses
-`quant_method: humming`, `weight_dtype: int3`, `input_dtype: bfloat16`, and
-`weight_scale_group_size: 128`. Preserve exclusions for unquantized projections,
-including fused attention projections. The expert checkpoint uses consolidated
-gate/up and down tensors with their corresponding group scales.
+On DGX Spark (GB10, SM121), use
+`--quantization modelopt_mixed --moe-backend auto --dtype bfloat16`.
+Install the optional [b12x dependencies](b12x.md). Keep `--moe-backend auto`:
+IQ2 experts use b12x, while retained BF16 experts use Triton on SM12x.
 
-## Validation limits
+The adapter requires BF16 activations, DP1, PCP1, and no expert parallelism.
+It expands each selected route into a separate b12x row so Muse can normalize
+expert outputs before combining them. This adds intermediate storage and work.
+The configuration below was tested with eager execution; CUDA graph support
+has not been validated.
 
-Real Muse expert-layer weights have been exercised at TP1 and TP4 on GB10.
-This verifies execution against the decoded INT3 reference. It does not measure
-the quality loss caused by converting NVFP4 weights to INT3.
+### Checkpoint configuration
 
-A converted 816B checkpoint has completed startup and short chat generations on
-four GB10 nodes with TP4, BF16 activations, a 2,048-token context, one active
-sequence, and 1 GiB of KV cache per GPU. vLLM reported 89.0 GiB of model memory per
-rank; sharing target RoPE tables saved 11.25 GiB per rank before expert preparation.
-Nsight captures were collected on all four ranks for a generation request.
+Use `quant_method: modelopt`, `quant_algo: MIXED_PRECISION`, and a
+`quantized_layers` entry for each converted
+`model.language_model.layers.N.mlp.experts` prefix. Each entry needs:
 
-The smoke checks answered basic arithmetic and geography prompts and completed
-a short technical explanation. Runtime parameters, replicated projections,
-repacking buffers, KV cache, and the operating system also consume memory,
-especially on devices with shared CPU/GPU memory.
+```json
+{
+  "quant_algo": "IQ2_XS",
+  "group_size": 256,
+  "block_payload_bytes": 74,
+  "packing": "ggml"
+}
+```
 
-### Pilot evaluation
+Store consolidated gate/up and down tensors as IQ2_XS blocks. Unlisted experts
+remain BF16. Each block stores 256 weights in 74 bytes, or 2.3125 bits/weight
+including metadata. Retained BF16 tensors increase the full checkpoint size.
+IQ2_XXS and Q8_0 dispatch exists but has not been validated for Muse.
 
-On 2026-10-29, the converted checkpoint completed 100 GSM8K test examples and
-100 IFEval examples on four GB10 nodes. Each sample was drawn uniformly without
-replacement with selection seed 42. The run used zero-shot prompts, temperature
-0, generation seed 7, low reasoning effort, a 2,048-token context, and a
-1,536-token generation budget including reasoning. Server and client concurrency
-were both four; the other serving settings matched the smoke run above.
+The tested conversion used unweighted codebook search in ModelOpt revision
+[`cb9ab4de0698bfdf701cad4924093867b790eb17`](https://github.com/NVIDIA/Model-Optimizer/tree/cb9ab4de0698bfdf701cad4924093867b790eb17),
+with no calibration or training data. ModelOpt 0.47 lacks this encoder.
+Serving uses b12x 1.5.1 and does not run the encoder.
 
-| Metric | Result |
-| --- | --- |
-| GSM8K exact match, strict and flexible extraction | 95/100 (95%) |
-| IFEval prompt accuracy, strict and loose | 88/100 (88%) |
-| IFEval instruction accuracy, strict and loose | 132/148 (89.2%) |
-| Request errors | 0/200 |
-| Token-limit truncations | 2/100 GSM8K; 11/100 IFEval |
-| Empty final answers | 1/100 GSM8K; 4/100 IFEval |
+The source was the original NVFP4 checkpoint at revision
+`4239e4db19376904f2e82c167e78f70abb5455fe`. Expert layers 0 and 61 stayed BF16;
+the earlier INT3 conversion also quantized those layers. Comparisons between
+these checkpoints therefore include a difference in retained precision.
 
-Only final answer content was graded; the separate reasoning field was excluded.
-GSM8K prompts requested a final `#### <number>` line, scored by decimal-normalized
-numeric exact match. Flexible extraction used the last number in the final answer.
-IFEval used the unmodified Google Research strict and loose scorers. All selected
-cases, including truncations and empty final answers, remained in the denominator.
-The 95% Wilson intervals are 88.8–97.8% for GSM8K and 80.2–93.0% for IFEval
-prompt accuracy.
+### Four-node serving
 
-The data/scorer revisions were `3101c7d5072418e28b9008a6636bde82a006892c`
-for OpenAI's GSM8K repository and `1ae1fded5c616deb6b4652818588577e8fca0f06`
-for Google Research's IFEval implementation. All 189 rebuilt weight shards
-matched the previously served conversion by SHA256. These are 100-example
-pilots, not full benchmark runs. No original-NVFP4 baseline or controlled
-performance comparison was evaluated, so quantization accuracy loss and serving
-speedup remain unmeasured.
-
-### IQ2_XS with ModelOpt and b12x
-
-On DGX Spark (GB10, SM121), an offline-converted IQ2_XS checkpoint can select
-the experimental SM12x path
-with `--quantization modelopt_mixed --moe-backend auto --dtype bfloat16`.
-This uses b12x kernels inside vLLM and requires an already converted checkpoint.
-The Humming quantization flag does not select IQ2.
-
-Install the optional [b12x dependencies](b12x.md) in the serving environment.
-For Muse, keep `--moe-backend auto` so both IQ2 experts and retained BF16 experts
-can select their respective backends. The generic b12x example's explicit
-`--moe-backend b12x` is not the validated mixed Muse configuration.
-
-For the validated four-node setup, put an identical checkpoint at `MODEL_PATH`
-on every node and set `MASTER_ADDR` to the head node's reachable address.
-This recipe and the reported checks cover text generation only;
-`--language-model-only` disables multimodal inputs.
-Run this on each node with `NODE_RANK` set to 0, 1, 2, or 3 respectively:
+Place identical checkpoint files at `MODEL_PATH` on every node. Set
+`MASTER_ADDR` to the head node's reachable address and `NODE_RANK` to 0–3.
+Run this on each node:
 
 ```bash
 extra_args=(--host 0.0.0.0 --port 8000)
@@ -114,96 +96,15 @@ vllm serve "$MODEL_PATH" \
     "${extra_args[@]}"
 ```
 
-Configure the network interfaces for the actual cluster, following
-[distributed serving guidance](../../serving/parallelism_scaling.md).
+This recipe covers text generation; `--language-model-only` disables multimodal
+inputs. Configure network interfaces using the
+[distributed serving guide](../../serving/parallelism_scaling.md).
 
-Use `quant_method: modelopt`, `quant_algo: MIXED_PRECISION`, and a
-`quantized_layers` entry for each converted `model.language_model.layers.N.mlp.experts`
-prefix. Each entry must specify `quant_algo: IQ2_XS`, `group_size: 256`,
-`block_payload_bytes: 74`, and `packing: ggml`. Store consolidated gate/up and
-down expert tensors as native IQ2_XS blocks. Unlisted experts use BF16.
-IQ2_XS stores 256 weights in 74 bytes, including block metadata (2.3125 bits per
-weight). This density does not include the checkpoint's retained BF16 tensors.
+## DFlash2 speculative decoding with the IQ2 target
 
-The adapter requires BF16 activations and tensor parallelism, with DP1, PCP1,
-and expert parallelism disabled. On SM12x, retained BF16 experts use Triton.
-The IQ2 adapter expands selected routes into separate b12x rows, sums TP partial
-outputs before each expert's RMSNorm, and applies routing weights afterward.
-Eager execution is the validated mode; this work does not establish CUDA graph
-compatibility or a speedup over Humming.
-
-Serving validation used b12x 1.5.1. Offline encoding used ModelOpt development
-revision [`cb9ab4de0698bfdf701cad4924093867b790eb17`](https://github.com/NVIDIA/Model-Optimizer/tree/cb9ab4de0698bfdf701cad4924093867b790eb17);
-ModelOpt 0.47 lacks that IQ2 encoder. Serving already packed expert tensors uses
-vLLM's ModelOpt checkpoint loader and b12x kernels, without running the encoder.
-Four complete real Muse experts passed TP4 checks on GB10 against a decoded IQ2
-reference, with relative L2 errors of 0.00403, 0.00353, and 0.00306 at batch sizes
-1, 4, and 17. Retained BF16 experts also passed TP4 checks. These tests establish
-kernel correctness against the quantized weights, not model accuracy.
-
-The experimental conversion uses unweighted IQ2_XS codebook search without
-calibration data. It starts from the authorized original NVFP4 revision and
-retains BF16 expert layers 0 and 61. The earlier INT3 checkpoint also quantized
-those boundary experts, so any subsequent accuracy comparison must account for
-the different retained precision as well as the codec.
-
-The full conversion produced 189 weight shards with 299.53 GiB of tensor data.
-All four node copies passed SHA256 verification, and vLLM reached serving
-readiness with TP4 and a 32,768-token context. Model loading reported 80.38 GiB
-per rank, excluding the subsequent 4 GiB KV cache and runtime workspaces.
-Three arithmetic smoke requests returned the correct final answer under greedy
-low, sampled low, and sampled xhigh reasoning. An earlier greedy request reached
-its 256-token cap without a final answer; the three follow-ups used a 1,024-token
-cap and ran concurrently. These small checks establish generation, not IQ2
-accuracy or a controlled comparison with the earlier INT3 checkpoint.
-
-#### IQ2 streaming and partial GPQA results
-
-Eight streaming requests measured the TP4 deployment after warmup, with four
-requests at each concurrency. Temperature was 1, seed 7, reasoning effort
-`low`, and the output cap 512 tokens. These API measurements include reasoning
-and control tokens; TTFT measures the first generated token.
-
-| Measurement | Concurrency 1 | Concurrency 4 |
-| --- | --- | --- |
-| Aggregate output tokens/s | 11.59 | 30.37 |
-| Median per-request decode tokens/s | 11.92 | 8.05 |
-| Median TTFT | 0.946 s | 2.568 s |
-| Mean observed inter-token latency | 83.94 ms | 124.75 ms |
-
-There were zero request errors, six output-limit truncations, and four empty
-final answers. This small performance sample does not establish a speedup
-over INT3 or represent a production workload distribution.
-
-A separate IQ2 GPQA Diamond run used the same 198-question manifest, scorer,
-and generation settings as the INT3 run below, prioritizing its completed
-question IDs. After cluster access recovered on 2026-10-31, all 118 completed
-responses were retrieved, with 95 correct (80.5%). There were zero request
-errors and 12 capped responses with empty, unparsed final answers; those 12
-count as incorrect. The nominal 95% Wilson interval is 72.4–86.6%.
-Across the same 75 question IDs completed by both deployments, IQ2 scored
-65/75 (86.7%) and INT3 scored 68/75 (90.7%). Both used one pass; IQ2 also
-retained BF16 boundary experts that the INT3 conversion quantized.
-
-Slurm accounting confirms that the allocation timed out at 19:23:49 UTC on
-2026-10-30. Four requests were interrupted without response records and 76
-questions were never started. The 80 unfinished cases are missing, not scored
-incorrect. All 66 responses saved before the connectivity outage remain
-byte-identical within the recovered file, whose hash matches the remote copy.
-Completion order can bias this partial subset, and the interval does not cover
-that selection effect. This is not a complete GPQA score or a matched measurement
-of loss against original NVFP4. Published NVFP4 scores remain external references.
-Raw records, terminal logs, settings, and integrity hashes are preserved in the
-private experiment archive.
-
-### DFlash2 speculative decoding with the IQ2 target
-
-The experimental IQ2_XS target also served with the native vLLM DFlash2 draft
-on four DGX Sparks (GB10). DFlash2 is disabled in the IQ2 command above by
-default. To enable it, keep the IQ2 TP4 command and set
-`VLLM_USE_V2_MODEL_RUNNER=1`. Add `--gpu-memory-utilization 0.85` and append
-`--speculative-config` with this JSON,
-replacing `/path/to/draft` with the same local draft path on every node:
+DFlash2 is off in the command above. To enable it, set
+`VLLM_USE_V2_MODEL_RUNNER=1`, add `--gpu-memory-utilization 0.85`, and pass
+`--speculative-config` with this JSON:
 
 ```json
 {
@@ -215,20 +116,17 @@ replacing `/path/to/draft` with the same local draft path on every node:
 }
 ```
 
-The tested draft was
+Use the same draft path on every node. The tested draft was
 [`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2)
-at revision `22e2669e4c60689f9bff0749a34d9d8e59ce7cd6`. It is a five-layer
-BF16 draft used alongside the existing Muse target; do not replace the target
-checkpoint with it. Its 8.17 GiB weight file adds about 2.7% to the IQ2 target's
-299.53 GiB of tensor data. This storage calculation excludes runtime workspaces.
+at revision `22e2669e4c60689f9bff0749a34d9d8e59ce7cd6`. This five-layer BF16
+draft runs alongside the IQ2 target and shares its embedding and output-head
+storage. Its weight file is 8.17 GiB, about 2.7% of the IQ2 target's tensor size.
 
-Validation on 2026-10-31 used vLLM commit
-`5ea8301982648ac444ea01368ecb1b064f6de7bc`, the Muse overlay from this tracking
-branch at `b1190e0f5780ef557cb2d3ee9f75d92a29c3dd95`, b12x 1.5.1, BF16
-activations, eager execution, TP4, a 32,768-token context, four sequences,
-128 batched tokens, 4 GiB KV cache per rank, and GPU memory utilization 0.85.
-The runtime used the wheel from that upstream commit with these five Python
-files replaced by their versions at the pinned tracking-branch commit:
+### Tested runtime
+
+The October 31 measurements used a vLLM wheel from
+`5ea8301982648ac444ea01368ecb1b064f6de7bc`, with these files taken from tracking
+branch commit `b1190e0f5780ef557cb2d3ee9f75d92a29c3dd95`:
 
 - `vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py`
 - `vllm/model_executor/layers/quantization/humming.py`
@@ -236,170 +134,155 @@ files replaced by their versions at the pinned tracking-branch commit:
 - `vllm/models/muse_spark/nvidia/model.py`
 - `vllm/models/muse_spark/nvidia/muse_moe_runner.py`
 
-The upstream wheel alone does not include this experimental Muse IQ2 path.
-All original IQ2 checkpoint hashes and the pinned draft hash matched on all
-four nodes. Four-rank NCCL RoCE all-reduce and broadcast checks passed.
+The wheel alone lacks this Muse IQ2 adapter. Runs used b12x 1.5.1, BF16
+activations, TP4, eager execution, a 32,768-token context, four sequences,
+128 batched tokens, and 4 GiB KV cache per rank. Checkpoint hashes matched on
+all four nodes. NCCL RoCE checks passed, native `DFlash2Speculator` execution
+and accepted draft tokens were observed, and pointer checks confirmed shared
+embedding/head storage on every rank.
 
-Logs confirmed native `DFlash2Speculator` / `DFlash2Qwen3ForCausalLM`, with
-unquantized BF16 draft weights. Pointer checks verified that both the draft
-embedding and output head share the target's actual weight storage on every
-rank. vLLM reported 83.46 GiB of model-loading memory per rank, excluding later
-KV allocations and runtime workspaces. An arithmetic smoke completed with the
-correct final answer, and draft-token acceptance counters advanced.
+## Validation
 
-Eight measured requests then completed, four at concurrency 1 and four at
-concurrency 4, with zero errors, truncations, or empty final answers. The
-streaming client used four fixed short prompts, temperature 1, seed 7, low
-reasoning effort, and a 4,096-token output cap. Shape warmups preceded each
-measurement series, and unique cache salts prevented prompt-prefix reuse.
-Raw streaming events, responses, token counts, commands and counters were saved.
-The same IQ2 target was then measured without DFlash2 on the same nodes and
-runtime, using the identical prompts, request settings and warmup procedure.
-All eight baseline responses also completed without errors, truncations or empty
-final answers. The servers ran sequentially; each arm was warmed before timing.
+### Kernels and loading
 
-| Measurement | Baseline C1 | DFlash2 C1 | Baseline C4 | DFlash2 C4 |
+INT3 real-expert checks passed at TP1 and TP4 against decoded INT3 weights.
+IQ2 checks on four complete real experts passed at TP4, with relative L2 errors
+of 0.00403, 0.00353, and 0.00306 at token counts 1, 4, and 17. Retained BF16
+experts also passed. These checks compare kernels against the converted weights;
+model accuracy is measured separately below.
+
+| Deployment | Tensor storage | Model-loading memory/rank |
+| --- | --- | --- |
+| Humming INT3 | 334.03 GiB | 89.0 GiB |
+| IQ2_XS | 299.53 GiB | 80.38 GiB |
+| IQ2_XS + BF16 DFlash2 | 299.53 + 8.17 GiB | 83.46 GiB |
+
+All three served on four GB10 nodes. The memory figures exclude later KV cache
+allocations and runtime workspaces. INT3 startup used a 2,048-token context,
+one sequence, and 1 GiB KV per rank; shared RoPE tables saved 11.25 GiB/rank
+before expert preparation. INT3 Nsight captures were collected on all ranks.
+No DFlash2 Nsight breakdown of draft, verification, and communication was collected.
+
+### INT3 accuracy pilots
+
+On October 29, 100 examples per benchmark were sampled uniformly without
+replacement (selection seed 42). Settings: zero-shot prompts, temperature 0,
+generation seed 7, low reasoning, 2,048-token context, 1,536-token output cap
+including reasoning, TP4, four concurrent requests, and 1 GiB KV per rank.
+
+| Metric | Result |
+| --- | --- |
+| GSM8K exact match, strict and flexible | 95/100 (95%) |
+| IFEval prompt accuracy, strict and loose | 88/100 (88%) |
+| IFEval instruction accuracy, strict and loose | 132/148 (89.2%) |
+| Request errors | 0/200 |
+| Truncations | 2 GSM8K; 11 IFEval |
+| Empty final answers | 1 GSM8K; 4 IFEval |
+
+Only final content was scored. GSM8K used decimal-normalized numeric exact
+match with a requested `#### <number>` ending; flexible extraction used the
+last number. IFEval used the unmodified Google Research scorers. Truncations
+and empty answers stayed in the denominator. Wilson 95% intervals are
+88.8–97.8% for GSM8K and 80.2–93.0% for IFEval prompt accuracy.
+
+Data/scorer revisions: OpenAI GSM8K `3101c7d5072418e28b9008a6636bde82a006892c`;
+Google Research IFEval `1ae1fded5c616deb6b4652818588577e8fca0f06`.
+These are 100-case pilots. IQ2 and DFlash2 were not tested on these benchmarks.
+
+### Partial GPQA Diamond evaluations
+
+Each run attempted 198 questions and ended when its allocation expired.
+
+| Deployment | Correct/completed | Missing | Truncated, empty and unparsed finals | Nominal 95% Wilson interval |
 | --- | --- | --- | --- | --- |
-| Aggregate output tokens/s | 11.66 | 23.88 | 28.94 | 49.86 |
+| INT3, October 29 | 68/75 (90.7%) | 123 | 4 | 82.0–95.4% |
+| IQ2_XS, October 30 | 95/118 (80.5%) | 80 | 12 | 72.4–86.6% |
+| IQ2_XS + DFlash2, October 31 | 157/185 (84.9%) | 13 | 13 | 79.0–89.3% |
+
+There were zero saved request errors. In each row, truncation, empty final, and
+unparsed final refer to the same responses; they count as incorrect. Missing
+questions are excluded. Four requests per run were interrupted without response
+records; the other missing questions were never started.
+
+All runs used the same manifest and final-only scorer: xhigh reasoning,
+temperature 1, top_p 1, top_k disabled, seed 7, 16,384 output tokens including
+reasoning, 32,768 context tokens, TP4, concurrency four, and 4 GiB KV per rank.
+Prompt formatting, choice permutation (seed 0), and answer extraction followed
+OpenAI simple-evals `652c89d0ca9df547706735883097e9537d40dc47`; the dataset
+revision was `56686c06f5e19865c153de0fdb11be3890014df7`.
+IQ2 prioritized the 75 completed INT3 IDs. DFlash2 prioritized the 118 completed
+IQ2 IDs independently of correctness; all prompt token counts matched.
+
+On shared IDs:
+
+- INT3: 68/75; IQ2: 65/75. Both correct: 64; INT3 only: 4; IQ2 only: 1.
+- IQ2: 95/118; DFlash2: 99/118. Both correct: 93; IQ2 only: 2; DFlash2 only: 6.
+
+These are incomplete, single-pass results. Completion order can bias the subset,
+and the intervals do not account for that bias. The retained expert precision
+and historical runtime differ between runs. No matched original-NVFP4 baseline
+was evaluated, so these scores do not measure quantization loss or establish
+an accuracy gain from DFlash2. Raw responses and provenance are archived privately.
+
+### Streaming performance
+
+The October 31 comparison used four fixed 157–165-token prompts per concurrency
+and per configuration, after warmup. Both configurations used the same nodes,
+runtime and request settings: low reasoning, temperature 1, seed 7, and a
+4,096-token output cap. Servers ran sequentially; unique cache salts prevented
+prefix reuse. All 16 measured responses completed without errors, truncations,
+or empty finals.
+
+| Measurement | IQ2 C1 | DFlash2 C1 | IQ2 C4 | DFlash2 C4 |
+| --- | --- | --- | --- | --- |
+| Combined output tokens/s | 11.66 | 23.88 | 28.94 | 49.86 |
 | Median per-request decode tokens/s | 11.93 | 25.78 | 8.25 | 15.25 |
-| Median first-generated-token TTFT | 0.974 s | 0.973 s | 2.630 s | 2.912 s |
+| Median first-generated TTFT | 0.974 s | 0.973 s | 2.630 s | 2.912 s |
 | Median effective time/output token | 83.84 ms | 38.81 ms | 121.20 ms | 65.60 ms |
 | Median inter-chunk gap | 83.59 ms | 170.40 ms | 121.29 ms | 307.51 ms |
-| Median first final-answer content | 43.19 s | 19.55 s | 68.97 s | 34.92 s |
-| Mean tokens per streamed chunk | 1.00 | 4.36 | 1.00 | 4.75 |
+| Median first final-answer text | 43.19 s | 19.55 s | 68.97 s | 34.92 s |
+| Mean tokens/streamed chunk | 1.00 | 4.36 | 1.00 | 4.75 |
 
-Here C1/C4 mean one/four concurrent requests. Aggregate output throughput was
-2.05x/1.72x the corresponding baseline. Baseline model-loading memory was
-80.38 GiB per rank versus 83.46 GiB with DFlash2; neither is a total runtime peak.
+C1/C4 mean one/four concurrent requests. Combined throughput is total generated
+tokens divided by batch wall time, including queueing and prefill. Counts include
+reasoning and control tokens. TTFT measures the first generated token; final
+answer text arrives after reasoning. Effective time/output token averages the
+decode span. Speculative bursts do not expose individual token times within a chunk.
 
-DFlash2 accepted 1,608 of 3,318 proposed tokens at C1 (48.46%) and 1,733 of
-3,206 at C4 (54.05%). Across 474/458 draft steps, mean acceptance length was
-4.39/4.78 tokens including one target/bonus token, or 3.39/3.78 accepted draft
-tokens. Each step proposed seven draft tokens.
+With seven draft tokens per step, DFlash2 accepted 1,608/3,318 tokens at C1
+(48.46%) and 1,733/3,206 at C4 (54.05%). Mean acceptance length, including the
+bonus token, was 4.39/4.78 across 474/458 steps. The observed combined throughput
+was 2.05x/1.72x the baseline, with different sampled output lengths in each run.
+Four prompts in one pass are too few to characterize production performance.
 
-All output throughput includes reasoning and control tokens. First generated
-TTFT differs from first final-answer content, which follows reasoning. DFlash2
-returns bursts: effective time/output token averages the observed decode span
-and does not measure individual token latency inside a burst. The sparse subset
-of adjacent one-token chunks had mean gaps 171.41/301.06 ms (21/15 samples),
-so it must not be compared as a full ITL distribution with the baseline's
-83.85/121.64 ms (2,468/2,523 samples). No DFlash2 Nsight breakdown of draft
-computation, target verification, or communication was collected.
-
-This is four fixed prompts per concurrency per arm, one pass. Sampled outputs,
-lengths and reasoning counts differed between arms despite identical request
-settings. These observed speedups do not establish a production workload result
-or any model accuracy score. All raw responses, token arrivals, counters and
-exact launch commands are retained in the private experiment archive.
+An earlier IQ2-only run used a 512-token cap and four requests per concurrency.
+Combined throughput was 11.59/30.37 tokens/s, median decode 11.92/8.05 tokens/s,
+median TTFT 0.946/2.568 s, and mean ITL 83.94/124.75 ms. It had zero errors,
+six truncations and four empty finals; it is separate from the comparison above.
 
 #### DFlash2 with 8K uncached inputs
 
-A follow-up on 2026-11-01 measured the same four tasks at C1 and C4 after
-adding synthetic background to make each input exactly 8,192 tokens,
-including the chat template. Both tokenization and response usage confirmed
-the input length. Unique cache salts prevented prefix reuse, and server
-counters recorded all 32,768 input tokens computed in each four-request run.
+On November 1, synthetic background extended the same tasks to exactly 8,192
+input tokens including the chat template. Tokenization, response usage and
+server counters confirmed the input length and absence of prefix reuse.
+The target, draft, runtime packages, server and request settings stayed the
+same, including the 128-token scheduling budget. Physical nodes and drivers
+differed from the short-input run. All eight responses completed without errors,
+truncations or empty finals.
 
-The IQ2 target, BF16 draft, full runtime package list, and generation settings
-were unchanged: low reasoning, temperature 1, seed 7, and a 4,096-token output
-cap. Server settings retained TP4, eager execution, 32,768 context tokens,
-four sequences, `max_num_batched_tokens=128`, 4 GiB KV cache per rank, and
-seven probabilistic draft tokens. All eight measured responses finished with
-zero request errors, truncations, or empty final answers.
-
-| Measurement | 8K input C1 | 8K input C4 |
+| Measurement | C1 | C4 |
 | --- | --- | --- |
 | Median first-generated TTFT | 37.18 s | 101.38 s |
-| Median first final-content latency | 43.85 s | 119.98 s |
-| Median per-request decode throughput | 18.84 tokens/s | 6.10 tokens/s |
-| Aggregate output throughput, including prefill | 5.06 tokens/s | 7.83 tokens/s |
-| Median effective time per output token | 53.82 ms | 168.13 ms |
+| Median first final-answer text | 43.85 s | 119.98 s |
+| Median per-request decode tokens/s | 18.84 | 6.10 |
+| Combined output tokens/s | 5.06 | 7.83 |
+| Median effective time/output token | 53.82 ms | 168.13 ms |
 | Median inter-chunk gap | 172.27 ms | 581.27 ms |
-| Mean acceptance length, including bonus | 3.41 tokens | 3.81 tokens |
+| Mean acceptance length, including bonus | 3.41 | 3.81 |
 
-Draft acceptance was 732/2,128 proposed tokens (34.40%) across 304 draft
-steps at C1, and 1,129/2,814 (40.12%) across 402 steps at C4. Generated output
-totaled 1,040/1,535 tokens, including 486/975 reasoning tokens. Throughput
-includes reasoning and control tokens; speculative bursts still prevent
-observing individual token timestamps within each burst.
-
-Server timing counters showed mean prefill spans of 37.02/41.86 seconds
-and mean queue waits below 0.001/58.69 seconds at C1/C4. These are wall-clock
-request spans, including scheduling interference, rather than isolated GPU
-kernel timings. The 128-token batching limit remained unchanged.
-
-The earlier short inputs were 157–165 tokens, with TTFT 0.97/2.91 seconds,
-median decode throughput 25.78/15.25 tokens/s, and aggregate output throughput
-23.88/49.86 tokens/s. This follow-up used different physical nodes and GPU
-drivers; sampled output lengths also differed. Four synthetic prompts per
-concurrency in one pass do not isolate a causal input-length effect or establish
-production performance. Raw responses, streams, counters, settings, hashes,
-and the complete runtime and checkpoint verification evidence are retained
-in the private experiment archive.
-
-#### Interrupted DFlash2 GPQA Diamond evaluation
-
-A separate accuracy run on 2026-10-31 attempted all 198 GPQA Diamond questions
-with the same IQ2_XS target and the BF16 DFlash2 draft. The allocation reached
-its time limit after 185 responses completed, with 157 correct (84.9% of
-completed cases). Four requests were interrupted without response records,
-and nine questions were never started. These 13 missing cases are excluded
-from the completed-case score; this is not the full 198-question result.
-
-The saved responses contain zero request errors. Thirteen completed responses
-were both truncated at the output limit and empty/unparsed in their final
-answers; all count as incorrect. The nominal 95% Wilson interval among completed
-cases is 79.0–89.3%. This was one stochastic pass, and completion before a time
-limit can bias the subset; that selection effect is not included in the interval.
-
-Generation settings matched the historical IQ2 evaluation: `xhigh` reasoning,
-temperature 1, `top_p=1`, disabled `top_k`, seed 7, 16,384 output tokens including
-reasoning, 32,768 context tokens, and concurrency four. The manifest, prompt,
-choice permutation, and final-only scorer were unchanged apart from the served
-model name. Fresh tokenization matched all historical prompt counts. The 118
-previously completed IQ2 question IDs were prioritized independently of
-correctness, followed by the other 80.
-
-On those same 118 IDs, IQ2 with DFlash2 scored 99/118 (83.9%) and historical
-IQ2 without the draft scored 95/118 (80.5%). Both answered the same 93 questions
-correctly; six were
-correct only with DFlash2 and two only in the historical IQ2 run. The latter
-used a different runtime setup; these one-pass results do not establish that
-DFlash2 improves accuracy. There is no matched original-NVFP4 baseline, so
-published NVFP4 results remain external references, not quantization-loss
-measurements.
-
-All 185 raw responses, missing IDs, scoring results, settings, and termination
-evidence are preserved privately. The previously saved 161 records remain
-byte-identical, and the final local and remote response hashes match. Benchmark
-questions and raw examples are excluded from this documentation.
-
-### Interrupted INT3 GPQA Diamond evaluation
-
-A separate run on 2026-10-29 attempted all 198 GPQA Diamond questions with
-the Humming INT3 checkpoint. The eight-hour allocation expired after 75
-responses completed; 68 of those 75 were correct (90.7%). Another four requests
-were interrupted without response records, and 119 questions were not started.
-The 123 unfinished cases are missing, rather than completed incorrect answers.
-This is not a complete 198-question benchmark score.
-
-The 75 completed requests had zero request errors. Four reached the output
-limit with empty, unparsed final answers; all four remain in the denominator
-as incorrect. The nominal 95% Wilson interval among completed cases is
-82.0–95.4%. This incomplete single pass can favor requests that finish sooner;
-that selection effect is not covered by the interval. There is no matched
-original-NVFP4 run, so this result does not measure quantization accuracy loss.
-Published NVFP4 scores are external references with different evaluation setups.
-
-This run used TP4 on four GB10 nodes, BF16 activations, eager execution, a
-32,768-token context, 4 GiB of KV cache per rank, concurrency four, `xhigh`
-reasoning effort, temperature 1, `top_p=1`, disabled `top_k`, generation seed 7,
-and 16,384 output tokens including reasoning. Settings stayed unchanged.
-The prompt, choice permutation, and final-answer extraction followed
-OpenAI simple-evals at `652c89d0ca9df547706735883097e9537d40dc47`, with
-choice-permutation seed 0. The author dataset revision was
-`56686c06f5e19865c153de0fdb11be3890014df7`. Only final answer content was scored.
-All raw responses, missing-case IDs, settings, and termination logs were retained
-in the private evaluation archive; the user stopped further INT3 evaluation.
-Benchmark examples are omitted
-from this documentation.
+Draft acceptance was 732/2,128 (34.40%) across 304 steps at C1 and
+1,129/2,814 (40.12%) across 402 steps at C4. Output totaled 1,040/1,535 tokens,
+including 486/975 reasoning tokens. Mean queue waits were below 0.001/58.69 s;
+mean prefill spans were 37.02/41.86 s. These spans include scheduling interference
+and are not isolated kernel timings. This is one pass with variable output
+lengths on different nodes, so it does not isolate the effect of input length.

@@ -6,7 +6,7 @@ Every expert backend stops after GEMM2 and hands its rows to the finalizer.
 """
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -90,6 +90,10 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     tp_group_spans_nodes,
 )
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+    from vllm.utils.b12x import B12xWarmupUnit
 
 logger = init_logger(__name__)
 
@@ -461,7 +465,7 @@ def _attach_post_expert_finalize(
         " | MuseSparkHummingMoE"
     ),
 ) -> None:
-    """Hand the layer's finalizer to its experts, which exist only now."""
+    """Attach the finalizer after the expert kernel is initialized."""
     assert quant_method.moe_kernel is not None
     quant_method.moe_kernel.fused_experts.post_gemm2_hook = (
         quant_method.muse_post_expert_finalize
@@ -790,7 +794,7 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
 
 
 class MuseSparkHummingMoE(HummingMoEMethod):
-    """Humming WNA16 experts with Muse's pre-norm TP reduction."""
+    """Humming experts with TP reduction before per-expert RMSNorm."""
 
     muse_post_expert_finalize: MusePostExpertFinalize
     # Re-encoding all experts at once expands packed INT3 to INT32 during load.
@@ -831,7 +835,7 @@ class MuseSparkHummingMoE(HummingMoEMethod):
 
 
 class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
-    """Keep b12x routes separate until Muse's post-expert normalization."""
+    """Normalize each b12x expert output before the weighted sum."""
 
     muse_post_expert_finalize: MusePostExpertFinalize
 
@@ -839,21 +843,33 @@ class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
         _validate_route_major_deployment(moe)
         super().__init__(moe, codec)
 
-    def process_weights_after_loading(self, layer) -> None:
+    def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
         super().process_weights_after_loading(layer)
         layer.b12x_warmup_provider = self
 
-    def _apply_routes(self, layer, x, topk_ids):
-        # One unit-weight route per expanded token prevents the b12x kernel
-        # from combining experts before Muse normalizes each GEMM2 result.
-        expanded = x.repeat_interleave(topk_ids.shape[1], dim=0)
-        ids = topk_ids.reshape(-1, 1).contiguous()
-        weights = torch.ones(ids.shape, dtype=torch.float32, device=x.device)
-        return super().apply(layer, expanded, weights, ids, None, None)
+    def _apply_routes(
+        self,
+        layer: "MuseSparkRoutedExperts",
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # One route per row keeps b12x from summing experts before RMSNorm.
+        route_inputs = x.repeat_interleave(topk_ids.shape[1], dim=0)
+        route_ids = topk_ids.reshape(-1, 1).contiguous()
+        route_weights = torch.ones(
+            route_ids.shape, dtype=torch.float32, device=x.device
+        )
+        return super().apply(layer, route_inputs, route_weights, route_ids, None, None)
 
     def apply(
-        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
-    ):
+        self,
+        layer: "MuseSparkRoutedExperts",
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: "SharedExperts | None",
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
         if shared_experts is not None or layer.apply_router_weight_on_input:
             raise NotImplementedError(
                 "Muse block quantization requires separate, unweighted routes"
@@ -861,22 +877,27 @@ class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
         output = torch.empty_like(x)
         if x.shape[0] == 0:
             return output
-        rows = self._apply_routes(layer, x, topk_ids)
+        expert_outputs = self._apply_routes(layer, x, topk_ids)
         self.muse_post_expert_finalize(
-            route_major_moe_output(rows, topk_weights, topk_ids, None), output
+            route_major_moe_output(expert_outputs, topk_weights, topk_ids, None), output
         )
         return output
 
-    def get_b12x_warmup_unit(self, layer, token_counts, output_dtype):
+    def get_b12x_warmup_unit(
+        self,
+        layer: "MuseSparkRoutedExperts",
+        token_counts: tuple[int, ...],
+        output_dtype: torch.dtype,
+    ) -> "B12xWarmupUnit":
         from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
         from vllm.utils.b12x import B12xWarmupUnit
 
         assert self.moe_kernel is not None
         experts = self.moe_kernel.fused_experts
         assert isinstance(experts, B12xExperts)
-        base = experts.get_b12x_warmup_unit(layer, token_counts, output_dtype)
+        expert_warmup = experts.get_b12x_warmup_unit(layer, token_counts, output_dtype)
 
-        def compile_routes():
+        def compile_routes() -> None:
             device = next(layer.parameters()).device
             topk = self.moe.experts_per_token
             for count in sorted(set(token_counts)):
@@ -885,13 +906,13 @@ class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
                 x = torch.zeros(
                     count, self.moe.hidden_dim, dtype=output_dtype, device=device
                 )
-                ids = torch.arange(topk, dtype=torch.int32, device=device)
-                ids = ids.remainder(self.moe.num_experts).expand(count, -1)
-                self._apply_routes(layer, x, ids)
+                route_ids = torch.arange(topk, dtype=torch.int32, device=device)
+                route_ids = route_ids.remainder(self.moe.num_experts).expand(count, -1)
+                self._apply_routes(layer, x, route_ids)
 
         return B12xWarmupUnit(
             name="Muse block-quantized routes",
-            key=("muse_routes", base.key),
+            key=("muse_routes", expert_warmup.key),
             compile=compile_routes,
         )
 
