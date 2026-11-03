@@ -515,11 +515,17 @@ steps:
   - csrc/moe/
   - tests/kernels/moe
   - vllm/model_executor/layers/fused_moe/
+  - vllm/model_executor/layers/quantization/humming.py
+  - vllm/model_executor/layers/quantization/utils/humming/
+  - vllm/models/muse_spark/nvidia/
   - vllm/distributed/device_communicators/
   - vllm/envs.py
   - vllm/config
   commands:
-    - pytest -v -s kernels/moe --ignore=kernels/moe/test_modular_oai_triton_moe.py
+    - >-
+      pytest -v -s
+      kernels/moe
+      --ignore=kernels/moe/test_modular_oai_triton_moe.py
     - pytest -v -s kernels/moe/test_modular_oai_triton_moe.py
   mirror:
     amd:
@@ -544,6 +550,13 @@ steps:
       - vllm/model_executor/layers/quantization/utils/quant_utils.py
       depends_on:
       - image-build-amd
+      commands:
+      - >-
+        pytest -v -s
+        kernels/moe
+        --ignore=kernels/moe/test_modular_oai_triton_moe.py
+        --ignore=kernels/moe/test_muse_spark_humming_moe.py
+      - pytest -v -s kernels/moe/test_modular_oai_triton_moe.py
 
 - label: ":nvidia: (H200 MIG 35GB) Mamba Kernels"
   device: h200_35gb
@@ -792,6 +805,27 @@ steps:
         tests/kernels/test_rocm_fp32_router_gemm.py
         tests/kernels/test_gate_linear_rocm_dispatch.py
         tests/kernels/test_bf16x3_router_gemm_rocm.py
+
+- label: ":nvidia: (DGX Spark) Muse block quantization"
+  key: muse-block-quantization-dgx-spark
+  timeout_in_minutes: 30
+  device: dgx-spark
+  num_devices: 1
+  depends_on:
+  - arm64-image-build
+  source_file_dependencies:
+  - vllm/models/muse_spark/
+  - vllm/model_executor/layers/fused_moe/b12x.py
+  - vllm/model_executor/layers/quantization/modelopt.py
+  - vllm/model_executor/layers/quantization/modelopt_block_quant.py
+  - tests/kernels/moe/test_muse_spark_block_quant_moe.py
+  - tests/kernels/moe/muse_spark_utils.py
+  commands:
+  - uv venv --system-site-packages /tmp/muse-block-tests
+  - >-
+    uv pip install --python /tmp/muse-block-tests/bin/python
+    b12x==1.5.1 cuda-python==13.4.4 apache-tvm-ffi==0.1.11
+  - /tmp/muse-block-tests/bin/python -m pytest -v -s kernels/moe/test_muse_spark_block_quant_moe.py
 
 # Disabled until b12x transitive dependencies are locked.
 # - label: ":nvidia: (DGX Spark) [Nightly] b12x Linear Kernels"

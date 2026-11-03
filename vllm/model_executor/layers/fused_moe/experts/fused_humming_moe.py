@@ -29,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
 from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
+from vllm.model_executor.layers.fused_moe.moe_output import route_major_moe_output
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
     get_moe_permute_scratch,
@@ -868,6 +869,15 @@ class HummingIndexedExperts(HummingExpertsBase):
             outputs=buffers["down_output"].view(-1, hidden_states.size(-1)),
             **moe_kwargs2,
         )
+
+        if self._uses_post_gemm2_hook(topk_ids.shape[0]):
+            self._run_post_gemm2_hook(
+                route_major_moe_output(
+                    buffers["down_output"], topk_weights, topk_ids, expert_map
+                ),
+                output,
+            )
+            return
 
         # expert_map masks any non-local id; num_valid_tokens bounds the
         # persistent kernel to the real token rows [0, num_recv) so the padding

@@ -67,7 +67,12 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.humming import HummingConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
@@ -1094,23 +1099,6 @@ class MuseSpark1xAttention(nn.Module):
         self.is_sequence_parallel_output = False
         self.gemm_rs = None
 
-        self.rotary_emb = (
-            RotaryEmbedding(
-                head_size=self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position_embeddings=max_position_embeddings,
-                base=rope_theta,
-                is_neox_style=False,
-                dtype=(
-                    torch.float
-                    if not is_draft or config.rope_use_fp32_in_outer_product
-                    else self.default_dtype
-                ),
-            )
-            if self.use_rope
-            else None
-        )
-
         sliding_window = None
         if is_draft:
             if global_attn_cfg := config.global_attn_cfg:
@@ -1157,6 +1145,34 @@ class MuseSpark1xAttention(nn.Module):
             and self.default_dtype in (torch.bfloat16, torch.float16)
             and supports_fused_kv_insert(self.attn)
         )
+
+        self.rotary_emb: RotaryEmbedding | None
+        # The fused path reads FP32 tables without the fallback's dtype mutation.
+        if self.use_rope and not is_draft and self.fused_qk_norm_rope_kv_insert:
+            self.rotary_emb = get_rope(
+                head_size=self.head_dim,
+                max_position=max_position_embeddings,
+                is_neox_style=False,
+                rope_parameters={"rope_type": "default", "rope_theta": rope_theta},
+                dtype=torch.float32,
+            )
+        else:
+            self.rotary_emb = (
+                RotaryEmbedding(
+                    head_size=self.head_dim,
+                    rotary_dim=self.head_dim,
+                    max_position_embeddings=max_position_embeddings,
+                    base=rope_theta,
+                    is_neox_style=False,
+                    dtype=(
+                        torch.float
+                        if not is_draft or config.rope_use_fp32_in_outer_product
+                        else self.default_dtype
+                    ),
+                )
+                if self.use_rope
+                else None
+            )
 
     @staticmethod
     def compute_attn_temperature_scale(
@@ -1765,8 +1781,12 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
     decoder_layer_cls = MuseSpark1xDecoderLayer
     supported_quantization_configs: tuple[type[QuantizationConfig], ...] = (
         ModelOptNvFp4Config,
+        HummingConfig,
+        ModelOptMixedPrecisionConfig,
     )
-    supported_quantization_description = "NVFP4 (modelopt_fp4)"
+    supported_quantization_description = (
+        "NVFP4 (modelopt_fp4), converted Humming, or ModelOpt IQ2 block codecs"
+    )
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],

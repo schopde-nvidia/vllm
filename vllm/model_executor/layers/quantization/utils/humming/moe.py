@@ -348,6 +348,7 @@ def _convert_sublayer_to_humming(
     input_schema: Any,
     num_experts: int,
     param_dtype: torch.dtype,
+    convert_symmetric_integer: bool = True,
 ) -> tuple[Any, Any]:
     """Convert a sublayer's weights from checkpoint format to Humming format.
 
@@ -368,6 +369,7 @@ def _convert_sublayer_to_humming(
         shape_k_stacks=shape_k_stacks,
         param_dtype=param_dtype,
         num_experts=num_experts,
+        convert_symmetric_integer=convert_symmetric_integer,
     )
 
     converted_input_schema, input_tensors = input_schema.convert_humming(
@@ -436,6 +438,7 @@ def _process_single_sublayer(
     param_dtype: torch.dtype,
     force_weight_schema: Any | None = None,
     allow_input_schema_fallback: bool = True,
+    convert_symmetric_integer: bool = True,
 ) -> tuple[Any, Any, "LayerConfig"]:
     """Process a single sublayer: convert, optionally requant, prepare, and transform.
 
@@ -454,6 +457,7 @@ def _process_single_sublayer(
         param_dtype: Parameter data type
         force_weight_schema: Optional schema to force requantization to
         allow_input_schema_fallback: Whether incompatible input schemas may be replaced.
+        convert_symmetric_integer: Whether to re-encode integer weights for Humming.
 
     Returns:
         Tuple of the final weight schema, input schema, and Humming layer config.
@@ -471,6 +475,7 @@ def _process_single_sublayer(
         input_schema=input_schema,
         num_experts=num_experts,
         param_dtype=param_dtype,
+        convert_symmetric_integer=convert_symmetric_integer,
     )
 
     # Step 2: Force requant if needed
@@ -521,6 +526,7 @@ def convert_to_humming_moe_kernel_format(
     input_schema: Any | None = None,
     force_weight_schema: Any | None = None,
     allow_input_schema_fallback: bool = True,
+    convert_symmetric_integer: bool = True,
 ) -> dict[str, "LayerConfig"]:
     """Convert MoE weights from checkpoint format to Humming kernel format.
 
@@ -544,6 +550,7 @@ def convert_to_humming_moe_kernel_format(
                      If None, built from quant_config or env vars.
         force_weight_schema: Optional schema to force requantization to
         allow_input_schema_fallback: Whether incompatible input schemas may be replaced.
+        convert_symmetric_integer: Whether to re-encode integer weights for Humming.
 
     Side effects:
         - Modifies layer parameters in place
@@ -614,6 +621,7 @@ def convert_to_humming_moe_kernel_format(
                 param_dtype=param_dtype,
                 force_weight_schema=force_weight_schema,
                 allow_input_schema_fallback=allow_input_schema_fallback,
+                convert_symmetric_integer=convert_symmetric_integer,
             )
         )
 
