@@ -24,6 +24,11 @@ from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
     HummingGroupedExperts,
     HummingIndexedExperts,
 )
+from vllm.model_executor.layers.quantization.utils.humming.linear import (
+    get_live_param,
+    kernel_parameters,
+    replace_layer_parameters,
+)
 from vllm.model_executor.layers.quantization.utils.humming.schema import (
     humming_is_layer_skipped,
 )
@@ -32,6 +37,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.utils.import_utils import has_humming
 
 if TYPE_CHECKING:
@@ -145,7 +151,7 @@ def get_humming_moe_quant_config(
         and weight_schema.hadamard_block_size <= 1
         and input_schema.input_quant_mode in (None, "dynamic_group")
     ):
-        q_dtype = humming_schema._HUMMING_TO_QUANT_DTYPE.get(
+        q_dtype = humming_schema._humming_to_quant_dtype().get(
             input_schema.a_dtype, FP8_DTYPE
         )
         activation_group_shape = GroupShape(row=1, col=input_scale_group_size)
@@ -168,14 +174,14 @@ def get_humming_moe_quant_config(
         weight_dtype=str(weight_schema.b_dtype),
         weight_group_shape=weight_group_shape,
         activation_group_shape=activation_group_shape,
-        w1_scale=getattr(layer, "w13_weight_scale", None),
-        w1_gscale=getattr(layer, "w13_weight_scale_2", None),
-        w1_zp=getattr(layer, "w13_zero_point", None),
-        w1_bias=getattr(layer, "w13_bias", None),
-        w2_scale=getattr(layer, "w2_weight_scale", None),
-        w2_gscale=getattr(layer, "w2_weight_scale_2", None),
-        w2_zp=getattr(layer, "w2_zero_point", None),
-        w2_bias=getattr(layer, "w2_bias", None),
+        w1_scale=get_live_param(layer, "w13_weight_scale"),
+        w1_gscale=get_live_param(layer, "w13_weight_scale_2"),
+        w1_zp=get_live_param(layer, "w13_zero_point"),
+        w1_bias=get_live_param(layer, "w13_bias"),
+        w2_scale=get_live_param(layer, "w2_weight_scale"),
+        w2_gscale=get_live_param(layer, "w2_weight_scale_2"),
+        w2_zp=get_live_param(layer, "w2_zero_point"),
+        w2_bias=get_live_param(layer, "w2_bias"),
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -189,7 +195,7 @@ def get_humming_moe_quant_config(
         )
         for name in ("input_scale", "input_scale_2"):
             key = f"{prefix}_{name}"
-            value = getattr(layer, f"{sublayer}_{name}", None)
+            value = get_live_param(layer, f"{sublayer}_{name}")
             setattr(config, key, value)
     return config
 
@@ -215,11 +221,7 @@ def select_humming_moe_experts(
     # NOTE(rob): We need to peak into the P/F selection to determine
     # if we are using the batched or standard expert format, which
     # if not ideal. Once we unify TP + DP/EP, we can select P/F first.
-    activation_format = (
-        mk.FusedMoEActivationFormat.BatchedExperts
-        if config.moe_parallel_config.use_batched_activation_format
-        else mk.FusedMoEActivationFormat.Standard
-    )
+    activation_format = config.activation_format
 
     def _make_log_backend(experts_cls: type[mk.FusedMoEExperts]):
         return f"Using {experts_cls.__name__} Humming MoE backend."
@@ -274,7 +276,7 @@ def make_humming_moe_kernel(
     logger.info_once("Using %s", prepare_finalize.__class__.__name__)
 
     # Create Experts.
-    if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+    if prepare_finalize.activation_format.is_batched:
         max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
         assert max_num_tokens is not None
         experts = experts_cls(
@@ -301,12 +303,17 @@ def _extract_sublayer_tensors(
     layer: "RoutedExperts",
     sublayer_name: str,
 ) -> dict[str, torch.Tensor]:
-    """Extract tensors for a specific sublayer from the layer's state dict."""
-    return dict(
-        (key.removeprefix(sublayer_name + "_"), value)
-        for key, value in layer.state_dict().items()
+    """Extract a sublayer's live params and persistent buffers."""
+    buffers = {
+        name: buffer
+        for name, buffer in layer._buffers.items()
+        if buffer is not None and name not in layer._non_persistent_buffers_set
+    }
+    return {
+        key.removeprefix(sublayer_name + "_"): value
+        for key, value in (kernel_parameters(layer) | buffers).items()
         if key.startswith(sublayer_name + "_")
-    )
+    }
 
 
 def _replace_layer_parameters(
@@ -324,19 +331,15 @@ def _replace_layer_parameters(
         preserve_bias: If True, don't delete bias parameters
 
     """
-    # Delete old parameters
-    for name, _ in list(layer.named_parameters()):
-        if not name.startswith(sublayer_name + "_"):
-            continue
-        if preserve_bias and name == sublayer_name + "_bias":
-            continue
-        delattr(layer, name)
-
-    # Set new parameters
-    for name, tensor in tensors.items():
-        param_name = f"{sublayer_name}_{name}"
-        param = torch.nn.Parameter(tensor, requires_grad=False)
-        setattr(layer, param_name, param)
+    names = [
+        name
+        for name in layer._parameters
+        if name.startswith(sublayer_name + "_")
+        and not (preserve_bias and name == sublayer_name + "_bias")
+    ]
+    replace_layer_parameters(
+        layer, {f"{sublayer_name}_{n}": t for n, t in tensors.items()}, names
+    )
 
 
 def _convert_sublayer_to_humming(
@@ -348,7 +351,6 @@ def _convert_sublayer_to_humming(
     input_schema: Any,
     num_experts: int,
     param_dtype: torch.dtype,
-    convert_symmetric_integer: bool = True,
 ) -> tuple[Any, Any]:
     """Convert a sublayer's weights from checkpoint format to Humming format.
 
@@ -369,7 +371,6 @@ def _convert_sublayer_to_humming(
         shape_k_stacks=shape_k_stacks,
         param_dtype=param_dtype,
         num_experts=num_experts,
-        convert_symmetric_integer=convert_symmetric_integer,
     )
 
     converted_input_schema, input_tensors = input_schema.convert_humming(
@@ -438,7 +439,6 @@ def _process_single_sublayer(
     param_dtype: torch.dtype,
     force_weight_schema: Any | None = None,
     allow_input_schema_fallback: bool = True,
-    convert_symmetric_integer: bool = True,
 ) -> tuple[Any, Any, "LayerConfig"]:
     """Process a single sublayer: convert, optionally requant, prepare, and transform.
 
@@ -457,7 +457,6 @@ def _process_single_sublayer(
         param_dtype: Parameter data type
         force_weight_schema: Optional schema to force requantization to
         allow_input_schema_fallback: Whether incompatible input schemas may be replaced.
-        convert_symmetric_integer: Whether to re-encode integer weights for Humming.
 
     Returns:
         Tuple of the final weight schema, input schema, and Humming layer config.
@@ -475,7 +474,6 @@ def _process_single_sublayer(
         input_schema=input_schema,
         num_experts=num_experts,
         param_dtype=param_dtype,
-        convert_symmetric_integer=convert_symmetric_integer,
     )
 
     # Step 2: Force requant if needed
@@ -502,6 +500,10 @@ def _process_single_sublayer(
         input_schema=current_input_schema,
         param_dtype=param_dtype,
         allow_fallback=allow_input_schema_fallback,
+        # Humming's MoE grouped GEMM has no working FP8 path on SM100-SM119
+        # (the tuner can emit an invalid two-CTA UMMA config); keep the BF16
+        # fallback there until it is fixed.
+        allow_fp8_sm100=False,
     )
     config = _prepare_and_transform_sublayer(
         layer=layer,
@@ -518,6 +520,34 @@ def _process_single_sublayer(
     return current_weight_schema, current_input_schema, config
 
 
+def stage_moe_weights_for_humming(
+    layer: "RoutedExperts",
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_input_scale: torch.Tensor | None = None,
+    w2_input_scale: torch.Tensor | None = None,
+) -> str:
+    """Install canonical weights and scales for Humming's layer-based converter.
+
+    Returns the scale parameter name used, `weight_scale` or
+    `weight_scale_inv`.
+    """
+    scale_name = (
+        "weight_scale_inv" if hasattr(layer, "w13_weight_scale_inv") else "weight_scale"
+    )
+    replace_parameter(layer, "w13_weight", w13)
+    replace_parameter(layer, "w2_weight", w2)
+    replace_parameter(layer, f"w13_{scale_name}", w13_scale)
+    replace_parameter(layer, f"w2_{scale_name}", w2_scale)
+    if w13_input_scale is not None:
+        replace_parameter(layer, "w13_input_scale", w13_input_scale)
+    if w2_input_scale is not None:
+        replace_parameter(layer, "w2_input_scale", w2_input_scale)
+    return scale_name
+
+
 def convert_to_humming_moe_kernel_format(
     layer: "RoutedExperts",
     quant_config: dict | None = None,
@@ -526,7 +556,6 @@ def convert_to_humming_moe_kernel_format(
     input_schema: Any | None = None,
     force_weight_schema: Any | None = None,
     allow_input_schema_fallback: bool = True,
-    convert_symmetric_integer: bool = True,
 ) -> dict[str, "LayerConfig"]:
     """Convert MoE weights from checkpoint format to Humming kernel format.
 
@@ -550,7 +579,6 @@ def convert_to_humming_moe_kernel_format(
                      If None, built from quant_config or env vars.
         force_weight_schema: Optional schema to force requantization to
         allow_input_schema_fallback: Whether incompatible input schemas may be replaced.
-        convert_symmetric_integer: Whether to re-encode integer weights for Humming.
 
     Side effects:
         - Modifies layer parameters in place
@@ -621,7 +649,6 @@ def convert_to_humming_moe_kernel_format(
                 param_dtype=param_dtype,
                 force_weight_schema=force_weight_schema,
                 allow_input_schema_fallback=allow_input_schema_fallback,
-                convert_symmetric_integer=convert_symmetric_integer,
             )
         )
 

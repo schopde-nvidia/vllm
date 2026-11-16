@@ -27,11 +27,10 @@ Preserve checkpoint exclusions for unquantized projections, including fused
 attention projections. Store experts as consolidated gate/up and down tensors
 with their group scales.
 
-Muse skips Humming's optional integer re-encoding to avoid expanding an entire
-packed expert projection to INT32 during loading. Kernel repacking still needs
-working memory. NVIDIA target layers using fused QK normalization, RoPE, and KV
-insertion share FP32 RoPE tables. Draft and fallback paths keep private tables
-because their rotary operation can change the cache dtype.
+Use a Humming build containing the upstream
+[packed-weight conversion](https://github.com/vllm-project/humming/pull/207)
+(commit `9d71b3ecdfc62e7b4d5c6c9383cd8985b608cdac` or later).
+The adapter uses Humming's standard weight preparation.
 
 ## IQ2_XS with ModelOpt and b12x
 
@@ -141,7 +140,13 @@ all four nodes. NCCL RoCE checks passed, native `DFlash2Speculator` execution
 and accepted draft tokens were observed, and pointer checks confirmed shared
 embedding/head storage on every rank.
 
-## Validation
+## Historical validation
+
+The results below were collected on the earlier tracking branch and runtime.
+The adapter has since been updated onto upstream vLLM; GPU tests, serving and
+evaluations have not been repeated on that updated base. Upstream owns the
+[shared RoPE implementation](https://github.com/vllm-project/vllm/pull/65206)
+and Humming's packed-weight conversion.
 
 ### Kernels and loading
 
@@ -151,16 +156,14 @@ of 0.00403, 0.00353, and 0.00306 at token counts 1, 4, and 17. Retained BF16
 experts also passed. These checks compare kernels against the converted weights;
 model accuracy is measured separately below.
 
-| Deployment | Tensor storage | Model-loading memory/rank |
-| --- | --- | --- |
-| Humming INT3 | 334.03 GiB | 89.0 GiB |
-| IQ2_XS | 299.53 GiB | 80.38 GiB |
-| IQ2_XS + BF16 DFlash2 | 299.53 + 8.17 GiB | 83.46 GiB |
+| Deployment | Checkpoint tensor storage |
+| --- | --- |
+| Humming INT3 | 334.03 GiB |
+| IQ2_XS | 299.53 GiB |
+| IQ2_XS + BF16 DFlash2 | 299.53 + 8.17 GiB |
 
-All three served on four GB10 nodes. The memory figures exclude later KV cache
-allocations and runtime workspaces. INT3 startup used a 2,048-token context,
-one sequence, and 1 GiB KV per rank; shared RoPE tables saved 11.25 GiB/rank
-before expert preparation. INT3 Nsight captures were collected on all ranks.
+All three served on four GB10 nodes. INT3 startup used a 2,048-token context,
+one sequence, and 1 GiB KV per rank. INT3 Nsight captures were collected on all ranks.
 No DFlash2 Nsight breakdown of draft, verification, and communication was collected.
 
 ### INT3 accuracy pilots

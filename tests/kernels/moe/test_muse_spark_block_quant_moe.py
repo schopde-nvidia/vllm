@@ -11,11 +11,11 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
-from vllm.models.muse_spark.common.layers import MuseSpark1xRMSNormWithInputScale
+from vllm.models.muse_spark.common.layers import MuseSparkRMSNormWithInputScale
 from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseMoERunner,
-    MuseSpark1xRouter,
     MuseSparkRoutedExperts,
+    MuseSparkRouter,
 )
 from vllm.platforms import current_platform
 
@@ -63,7 +63,7 @@ def test_muse_block_experts_normalize_before_weighted_sum(
             },
         }
     )
-    norm = MuseSpark1xRMSNormWithInputScale(
+    norm = MuseSparkRMSNormWithInputScale(
         hidden,
         eps=1e-8,
         has_weight=True,
@@ -74,7 +74,7 @@ def test_muse_block_experts_normalize_before_weighted_sum(
     bias = torch.linspace(-0.5, 0.5, experts, device="cuda")
     config = VllmConfig(kernel_config=KernelConfig(moe_backend="auto"))
     with set_current_vllm_config(config):
-        router = MuseSpark1xRouter(
+        router = MuseSparkRouter(
             top_k=topk,
             num_experts=experts,
             expert_bias=bias,
