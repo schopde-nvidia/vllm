@@ -38,6 +38,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
     nvfp4_w4a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     select_deepseek_v4_mxfp4_moe_backend,
@@ -1285,7 +1286,64 @@ def test_b12x_moe_matches_torch(
     assert cosine > 0.99
 
 
+def _square_expert_rows(
+    unfinalized: UnfinalizedMoEOutput, output: torch.Tensor
+) -> None:
+    rows = unfinalized.gemm2_permuted.float().square()
+    weights = unfinalized.expert_weights
+    output.copy_((rows.view(*weights.shape, -1) * weights[..., None]).sum(dim=1))
+
+
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("weight_dtype", ["mxfp4", "nvfp4"])
+@torch.inference_mode()
+def test_b12x_post_gemm2_hook_receives_unweighted_routes(weight_dtype, workspace_init):
+    """A nonlinear finalizer must run on each route before weighting/reduction."""
+    with set_current_vllm_config(VllmConfig()):
+        case = _make_b12x_moe_case(weight_dtype, None, tokens=4)
+        kernel = _make_b12x_moe_kernel(
+            case.hidden_states,
+            case.w1,
+            case.w2,
+            case.topk,
+            case.activation,
+            case.quant_config,
+        )
+        weights, ids, _ = fused_topk(
+            case.hidden_states, case.score, case.topk, renormalize=False
+        )
+
+        def apply(topk_weights, topk_ids):
+            return kernel.apply(
+                hidden_states=case.hidden_states,
+                w1=case.w1,
+                w2=case.w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=case.activation,
+                global_num_experts=case.w1.shape[0],
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+
+        # Independent top-1 calls expose each route without a finalization hook.
+        routes = torch.stack(
+            [
+                apply(torch.ones_like(weights[:, :1]), ids[:, slot : slot + 1]).clone()
+                for slot in range(case.topk)
+            ],
+            dim=1,
+        )
+        expected = (routes.float().square() * weights[..., None]).sum(dim=1)
+        kernel.fused_experts.post_gemm2_hook = _square_expert_rows
+        actual = apply(weights, ids)
+
+    assert torch.isfinite(actual).all()
+    assert (actual.float() - expected).norm() / expected.norm() < 0.02
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("post_gemm2", [False, True])
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
     [
@@ -1297,6 +1355,7 @@ def test_b12x_moe_matches_torch(
 def test_b12x_moe_cuda_graph_replay(
     weight_dtype: str,
     activation_dtype: str | None,
+    post_gemm2: bool,
     workspace_init,
 ) -> None:
     from vllm.v1.worker.workspace import lock_workspace
@@ -1318,6 +1377,8 @@ def test_b12x_moe_cuda_graph_replay(
             case.activation,
             case.quant_config,
         )
+        if post_gemm2:
+            kernel.fused_experts.post_gemm2_hook = _square_expert_rows
         topk_weights, topk_ids, _ = fused_topk(
             case.hidden_states,
             case.score,

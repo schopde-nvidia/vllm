@@ -33,6 +33,10 @@ following `quantization.quant_algo` values:
   Such an embedding cannot be tied to the LM head, so checkpoints that tie it
   are rejected.
 
+For the experimental IQ2_XS expert path on DGX Spark, see
+[Muse Spark with Humming and IQ2 experts](muse_humming.md#iq2_xs-with-modelopt-and-b12x)
+for conversion metadata, b12x dependencies, and the validated serving setup.
+
 For per-tensor `FP8`, vLLM converts E4M3FN weights and scales to E4M3FNUZ
 when required by the GPU, for example on AMD MI300.
 

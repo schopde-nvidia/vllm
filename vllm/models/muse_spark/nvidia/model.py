@@ -69,7 +69,11 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.humming import HummingConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
@@ -1973,9 +1977,12 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
     supported_quantization_configs: tuple[type[QuantizationConfig], ...] = (
         ModelOptNvFp4Config,
         OnlineQuantizationConfig,
+        HummingConfig,
+        ModelOptMixedPrecisionConfig,
     )
     supported_quantization_description = (
-        "NVFP4 (modelopt_fp4) or online quantization (routed experts: "
+        "NVFP4 (modelopt_fp4), converted Humming, ModelOpt IQ2 block codecs, "
+        "or online quantization (routed experts: "
         "quantization_config={'moe': 'fp8_per_channel'})"
     )
 

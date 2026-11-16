@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     nvfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+    HummingIndexedExperts,
+)
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
@@ -55,9 +58,18 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.humming import (
+    HummingConfig,
+    HummingLayerQuantizationConfig,
+    HummingMoEMethod,
+)
 from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
+)
+from vllm.model_executor.layers.quantization.modelopt_block_quant import (
+    ModelOptBlockQuantMoEMethod,
 )
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
@@ -473,10 +485,12 @@ class MusePostExpertFinalize:
 
 
 def _attach_post_expert_finalize(
-    quant_method: "MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE "
-    "| MuseSparkFp8FusedMoE",
+    quant_method: (
+        "MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE"
+        " | MuseSparkHummingMoE | MuseSparkBlockQuantMoE | MuseSparkFp8FusedMoE"
+    ),
 ) -> None:
-    """Hand the layer's finalizer to its experts, which exist only now."""
+    """Attach the finalizer after the expert kernel is initialized."""
     assert quant_method.moe_kernel is not None
     quant_method.moe_kernel.fused_experts.post_gemm2_hook = (
         quant_method.muse_post_expert_finalize
@@ -784,7 +798,9 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
     muse_post_expert_finalize: MusePostExpertFinalize
 
     def __init__(self, moe: FusedMoEConfig) -> None:
-        self.use_route_major = current_platform.is_device_capability_family(90)
+        self.use_route_major = current_platform.is_device_capability_family(
+            90
+        ) or current_platform.is_device_capability_family(120)
         if self.use_route_major:
             _validate_route_major_deployment(moe)
             FusedMoEMethodBase.__init__(self, moe)
@@ -806,6 +822,59 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
         w2: torch.Tensor,
     ) -> None:
         super()._setup_kernel(layer, w13, w2)
+        _attach_post_expert_finalize(self)
+
+
+class MuseSparkHummingMoE(HummingMoEMethod):
+    """Humming experts with TP reduction before per-expert RMSNorm."""
+
+    muse_post_expert_finalize: MusePostExpertFinalize
+
+    def __init__(
+        self, quant_config: HummingLayerQuantizationConfig, moe: FusedMoEConfig
+    ) -> None:
+        _validate_route_major_deployment(moe)
+        pc = moe.moe_parallel_config
+        if pc.ep_size != 1 or pc.use_all2all_kernels:
+            raise NotImplementedError("MuseSpark Humming currently requires TP-only.")
+        from vllm.utils.humming import HummingWeightSchema
+
+        schema = quant_config.weight_schema
+        if not isinstance(schema, HummingWeightSchema):
+            raise NotImplementedError(
+                "Convert Muse expert tensors to Humming format before loading."
+            )
+        if schema.has_zero_point:
+            raise NotImplementedError(
+                "MuseSpark consolidated loader requires symmetric weights."
+            )
+        input_schema = quant_config.force_input_schema or quant_config.input_schema
+        input_schema = input_schema.to_humming_schema(moe.in_dtype)
+        if input_schema.a_dtype is not None and input_schema.a_dtype.num_bits < 16:
+            raise NotImplementedError(
+                "MuseSpark Humming currently requires BF16/FP16 inputs."
+            )
+        if quant_config.force_weight_schema is not None:
+            raise NotImplementedError("Convert Muse experts offline before loading.")
+        super().__init__(quant_config, moe)
+        self.experts_cls = HummingIndexedExperts
+
+    def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
+        super().process_weights_after_loading(layer)
+        _attach_post_expert_finalize(self)
+
+
+class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
+    """Block-quantized experts using Muse's post-GEMM2 finalizer."""
+
+    muse_post_expert_finalize: MusePostExpertFinalize
+
+    def __init__(self, moe: FusedMoEConfig, codec: str) -> None:
+        _validate_route_major_deployment(moe)
+        super().__init__(moe, codec)
+
+    def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
+        super().process_weights_after_loading(layer)
         _attach_post_expert_finalize(self)
 
 
@@ -875,7 +944,7 @@ class MuseSparkFp8FusedMoE(Fp8PtpcOnlineMoEMethod):
 
 
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
-    """Consolidated-tensor experts with the NVFP4 / FP8 / BF16 quant methods."""
+    """Consolidated-tensor experts with Muse-specific quantization adapters."""
 
     def _get_quant_method(
         self,
@@ -883,6 +952,19 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
         quant_config: QuantizationConfig | None,
         moe_config: FusedMoEConfig,
     ) -> FusedMoEMethodBase:
+        if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+            algo = quant_config._resolve_quant_algo(prefix)
+            if quant_config.is_layer_excluded(prefix) or algo is None:
+                return MuseSparkUnquantizedFusedMoE(moe_config)
+            if algo in ("IQ2_XS", "IQ2_XXS", "Q8_0"):
+                return MuseSparkBlockQuantMoE(moe_config, algo.lower())
+            raise NotImplementedError(
+                f"Muse mixed-precision experts do not support {algo}"
+            )
+        if isinstance(quant_config, HummingConfig):
+            config = quant_config.get_quant_config_for_layer(prefix, "moe")
+            if config is not None:
+                return MuseSparkHummingMoE(config, moe_config)
         if isinstance(quant_config, OnlineQuantizationConfig) and (
             resolved := quant_config.resolve_quant_method_cls(type(self), prefix)
         ):
@@ -919,6 +1001,8 @@ class MuseMoERunner(MoERunner):
         quant_method = cast(
             MuseSparkModelOptNvFp4FusedMoE
             | MuseSparkUnquantizedFusedMoE
+            | MuseSparkHummingMoE
+            | MuseSparkBlockQuantMoE
             | MuseSparkFp8FusedMoE,
             routed_experts.quant_method,
         )
