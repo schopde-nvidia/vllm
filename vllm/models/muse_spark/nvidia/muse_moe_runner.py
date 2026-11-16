@@ -6,7 +6,7 @@ Every expert backend stops after GEMM2 and hands its rows to the finalizer.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 
@@ -41,7 +41,6 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
     convert_flashinfer_moe_output,
-    route_major_moe_output,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
@@ -107,10 +106,6 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     tp_group_spans_nodes,
 )
 from vllm.platforms import current_platform
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
-    from vllm.utils.b12x import B12xWarmupUnit
 
 logger = init_logger(__name__)
 
@@ -492,7 +487,7 @@ class MusePostExpertFinalize:
 def _attach_post_expert_finalize(
     quant_method: (
         "MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE"
-        " | MuseSparkHummingMoE | MuseSparkFp8FusedMoE"
+        " | MuseSparkHummingMoE | MuseSparkBlockQuantMoE | MuseSparkFp8FusedMoE"
     ),
 ) -> None:
     """Attach the finalizer after the expert kernel is initialized."""
@@ -870,7 +865,7 @@ class MuseSparkHummingMoE(HummingMoEMethod):
 
 
 class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
-    """Normalize each b12x expert output before the weighted sum."""
+    """Block-quantized experts using Muse's post-GEMM2 finalizer."""
 
     muse_post_expert_finalize: MusePostExpertFinalize
 
@@ -880,76 +875,7 @@ class MuseSparkBlockQuantMoE(ModelOptBlockQuantMoEMethod):
 
     def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
         super().process_weights_after_loading(layer)
-        layer.b12x_warmup_provider = self
-
-    def _apply_routes(
-        self,
-        layer: "MuseSparkRoutedExperts",
-        x: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        # One route per row keeps b12x from summing experts before RMSNorm.
-        route_inputs = x.repeat_interleave(topk_ids.shape[1], dim=0)
-        route_ids = topk_ids.reshape(-1, 1).contiguous()
-        route_weights = torch.ones(
-            route_ids.shape, dtype=torch.float32, device=x.device
-        )
-        return super().apply(layer, route_inputs, route_weights, route_ids, None, None)
-
-    def apply(
-        self,
-        layer: "MuseSparkRoutedExperts",
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts: "SharedExperts | None",
-        shared_experts_input: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if shared_experts is not None or layer.apply_router_weight_on_input:
-            raise NotImplementedError(
-                "Muse block quantization requires separate, unweighted routes"
-            )
-        output = torch.empty_like(x)
-        if x.shape[0] == 0:
-            return output
-        expert_outputs = self._apply_routes(layer, x, topk_ids)
-        self.muse_post_expert_finalize(
-            route_major_moe_output(expert_outputs, topk_weights, topk_ids, None), output
-        )
-        return output
-
-    def get_b12x_warmup_unit(
-        self,
-        layer: "MuseSparkRoutedExperts",
-        token_counts: tuple[int, ...],
-        output_dtype: torch.dtype,
-    ) -> "B12xWarmupUnit":
-        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
-        from vllm.utils.b12x import B12xWarmupUnit
-
-        assert self.moe_kernel is not None
-        experts = self.moe_kernel.fused_experts
-        assert isinstance(experts, B12xExperts)
-        expert_warmup = experts.get_b12x_warmup_unit(layer, token_counts, output_dtype)
-
-        def compile_routes() -> None:
-            device = next(layer.parameters()).device
-            topk = self.moe.experts_per_token
-            for count in sorted(set(token_counts)):
-                if count <= 0:
-                    continue
-                x = torch.zeros(
-                    count, self.moe.hidden_dim, dtype=output_dtype, device=device
-                )
-                route_ids = torch.arange(topk, dtype=torch.int32, device=device)
-                route_ids = route_ids.remainder(self.moe.num_experts).expand(count, -1)
-                self._apply_routes(layer, x, route_ids)
-
-        return B12xWarmupUnit(
-            name="Muse block-quantized routes",
-            key=("muse_routes", expert_warmup.key),
-            compile=compile_routes,
-        )
+        _attach_post_expert_finalize(self)
 
 
 def _reject_direct_reload(*args, **kwargs) -> None:

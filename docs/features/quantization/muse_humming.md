@@ -40,8 +40,10 @@ Install the optional [b12x dependencies](b12x.md). Keep `--moe-backend auto`:
 IQ2 experts use b12x, while retained BF16 experts use Triton on SM12x.
 
 The adapter requires BF16 activations, DP1, PCP1, and no expert parallelism.
-It expands each selected route into a separate b12x row so Muse can normalize
-expert outputs before combining them. This adds intermediate storage and work.
+The shared b12x backend exposes separate expert outputs through its
+[`post_gemm2_hook`](../../design/fused_moe_modular_kernel.md#model-specific-expert-finalization),
+so Muse can normalize them before combining them. Route expansion lives in the
+backend; Muse supplies its finalizer. This adds intermediate storage and work.
 The configuration below was tested with eager execution; CUDA graph support
 has not been validated.
 

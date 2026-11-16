@@ -126,6 +126,29 @@ class FusedMoEModularKernel:
         return output
 ```
 
+## Model-specific expert finalization
+
+Models that need to process individual expert outputs can attach
+`FusedMoEExperts.post_gemm2_hook` to a compatible expert backend. The hook receives
+an `UnfinalizedMoEOutput` containing unweighted GEMM2 rows, routing weights and
+a map from selected routes to output rows. It must write the final token outputs
+into the supplied output tensor, including the weighted expert reduction.
+Any model-specific tensor-parallel reduction or normalization belongs in this
+finalizer.
+
+`HummingIndexedExperts` and `B12xExperts` support this contract. With a hook,
+b12x expands each route into a top-1 row with unit weight, then hands those rows
+to the finalizer. Planning, scratch allocation and warmup use that expanded
+shape. This adds activation copies and intermediate output storage proportional
+to the number of selected routes. Without a hook, b12x uses its standard fused
+weighted reduction. Input-side routing weights are incompatible with the hook
+because it requires unweighted expert rows.
+
+Attach the hook after creating the backend and before warmup or CUDA graph
+capture. Checkpoint tensor mappings and the model's finalizer remain separate
+from backend execution; sharing this interface does not imply support for
+arbitrary checkpoint layouts, hardware or parallelism configurations.
+
 ## How-To
 
 ### How To Add a FusedMoEPrepareAndFinalizeModular Type

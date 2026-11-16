@@ -103,6 +103,14 @@ def test_muse_block_experts_normalize_before_weighted_sum(
         checkpoint = packed if codec == "IQ2_XS" else decoded
         assert len(list(layer.load_weights(list(checkpoint.items())))) == 2
         layer.quant_method.process_weights_after_loading(layer)
+        if codec == "IQ2_XS":
+            assert layer.quant_method.moe_kernel.fused_experts.post_gemm2_hook is (
+                runner.post_expert_finalize
+            )
+            warmup = layer.b12x_warmup_provider.get_b12x_warmup_unit(
+                layer, (1, 17), torch.bfloat16
+            )
+            warmup.compile()
         x = torch.randn(17, hidden, dtype=torch.bfloat16, device="cuda") / 10
         logits = torch.randn(17, experts, device="cuda")
         actual = run_moe(runner, config, x, logits)

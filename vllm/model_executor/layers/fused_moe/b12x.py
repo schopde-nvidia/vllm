@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.moe_output import route_major_moe_output
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -729,6 +730,15 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         self._plans[key] = plan
         return plan
 
+    def _execution_shape(
+        self, tokens: int, topk: int, apply_router_weight_on_input: bool
+    ) -> tuple[int, int]:
+        if self._uses_post_gemm2_hook(tokens):
+            if apply_router_weight_on_input:
+                raise ValueError("b12x post_gemm2_hook requires unweighted expert rows")
+            return tokens * topk, 1
+        return tokens, topk
+
     def get_b12x_warmup_unit(
         self,
         layer: torch.nn.Module,
@@ -758,6 +768,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 int(self.moe_config.experts_per_token),
                 _b12x_activation_name(activation),
                 bool(layer.apply_router_weight_on_input),
+                self.post_gemm2_hook is not None,
                 limit,
                 alpha,
                 beta,
@@ -780,11 +791,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         limit, alpha, beta = self._swiglu_params(activation)
         prepared = self._prepared()
         device = prepared.w1_fp4.device
-        launch_tokens: dict[tuple[Any, ...], int] = {}
+        launch_tokens: dict[tuple[Any, ...], tuple[int, int]] = {}
         for tokens in sorted({int(count) for count in token_counts if int(count) > 0}):
+            execution_tokens, execution_topk = self._execution_shape(
+                tokens, topk, apply_router_weight_on_input
+            )
             execution_plan = _b12x_moe_execution_plan(
-                tokens=tokens,
-                topk=topk,
+                tokens=execution_tokens,
+                topk=execution_topk,
                 prepared=prepared,
                 quant_mode=self._quant_mode,
                 apply_router_weight_on_input=apply_router_weight_on_input,
@@ -793,9 +807,9 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_beta=beta,
             )
             signature = (execution_plan.implementation, execution_plan.execution)
-            launch_tokens.setdefault(signature, tokens)
+            launch_tokens.setdefault(signature, (execution_tokens, execution_topk))
 
-        for tokens in launch_tokens.values():
+        for tokens, topk in launch_tokens.values():
             hidden_states = torch.zeros(
                 (tokens, int(prepared.hidden_size)),
                 dtype=dtype,
@@ -850,9 +864,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         del N, global_num_experts, local_num_experts, expert_tokens_meta
+        tokens, execution_topk = self._execution_shape(
+            M, topk, self._apply_router_weight_on_input
+        )
         plan = self._plan(
-            tokens=M,
-            topk=topk,
+            tokens=tokens,
+            topk=execution_topk,
             activation=activation,
             apply_router_weight_on_input=self._apply_router_weight_on_input,
         )
@@ -891,9 +908,23 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         prepared = self._prepared()
         topk_ids = _normalize_topk_ids(topk_ids)
         topk_weights = _normalize_topk_weights(topk_weights)
+        tokens, topk = self._execution_shape(
+            int(hidden_states.shape[0]),
+            int(topk_ids.shape[1]),
+            bool(apply_router_weight_on_input),
+        )
+        hooked = self._uses_post_gemm2_hook(int(hidden_states.shape[0]))
+        if hooked:
+            # A top-1 launch per route preserves GEMM2 rows before weighting.
+            inputs = hidden_states.repeat_interleave(topk_ids.shape[1], dim=0)
+            ids = topk_ids.reshape(-1, 1).contiguous()
+            weights = torch.ones(ids.shape, dtype=torch.float32, device=ids.device)
+            rows = hidden_states.new_empty((tokens, hidden_states.shape[-1]))
+        else:
+            inputs, ids, weights, rows = hidden_states, topk_ids, topk_weights, output
         plan = self._plan(
-            tokens=int(hidden_states.shape[0]),
-            topk=int(topk_ids.shape[1]),
+            tokens=tokens,
+            topk=topk,
             activation=activation,
             apply_router_weight_on_input=bool(apply_router_weight_on_input),
         )
@@ -902,13 +933,17 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         _run_b12x_moe_plan(
             plan=plan,
             scratch=scratch,
-            hidden_states=hidden_states,
+            hidden_states=inputs,
             prepared=prepared,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            output=output,
+            topk_weights=weights,
+            topk_ids=ids,
+            output=rows,
             unit_scale_contract=self._quant_mode == "w4a16",
         )
+        if hooked:
+            self._run_post_gemm2_hook(
+                route_major_moe_output(rows, topk_weights, topk_ids, None), output
+            )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         raise NotImplementedError("LoRA is not supported for B12xExperts")
